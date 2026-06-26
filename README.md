@@ -1,4 +1,6 @@
-# Whole Body Motion Tracking
+# Whole Body Motion Tracking for X2 Robot
+
+> **Note:** This repository is forked from the original whole-body motion tracking project by Botian Xu, Tsinghua University, built on top of the [GentleHumanoid](https://gentle-humanoid.axell.top) codebase. It has been modified to support the **X2 robot** and includes additional training utilities such as resuming training from checkpoints while preserving the original WandB run continuity.
 
 This repository contains the training, evaluation, and deployment assets for a whole-body motion tracking policy built on top of the [GentleHumanoid](https://gentle-humanoid.axell.top) codebase.
 
@@ -118,3 +120,9 @@ For the actual deployment-side test procedure:
 - see [`sim2real/README.md`](./sim2real/README.md) for `sim2sim/sim2real` testing
 
 That README also explains how to use the UDP motion selector and the VR motion source during deployment.
+
+## License
+
+This project is licensed under the MIT License. See [LICENSE](./LICENSE) for details.
+
+The original codebase is Copyright (c) 2023 Botian Xu, Tsinghua University. Modifications for the X2 robot are Copyright (c) 2026 Xing1900.
