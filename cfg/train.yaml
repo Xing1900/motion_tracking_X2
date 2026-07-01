@@ -41,6 +41,6 @@ wandb:
     https_proxy: null
 
 defaults:
-  - task: G1/G1_gentle
+  - task: X2/X2_tracking
   - algo: ppo_train
   - _self_
