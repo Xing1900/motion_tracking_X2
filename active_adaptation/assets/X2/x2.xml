@@ -3,6 +3,7 @@
     autolimits="true" />
 
   <option timestep="0.001" />
+  <size njmax="2000" />
 
   <default>
       <default class="x2">
