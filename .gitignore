@@ -205,3 +205,13 @@ motion.npy
 dataset
 # local deployment checkpoints
 sim2real/assets/ckpts/
+
+# temporary files
+*.pid
+*.bak.*
+
+# generated artifacts / binary data
+exports/
+sim2real/assets/data/x2_motions/
+# X2 MuJoCo model + meshes are large; track with git-lfs or copy separately
+sim2real/assets/x2/
