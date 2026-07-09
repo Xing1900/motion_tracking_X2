@@ -39,6 +39,14 @@ Keyboard2Joystick = {
     'd': 'down'
 }
 
+# Arrow-key perturbation forces applied to the left hand (Newton).
+ArrowKeyForce = {
+    'up':    np.array([ 10.0,   0.0,   0.0]),
+    'down':  np.array([-10.0,   0.0,   0.0]),
+    'left':  np.array([  0.0,  10.0,   0.0]),
+    'right': np.array([  0.0, -10.0,   0.0]),
+}
+
 
 class Sim2sim:
     def __init__(self, args, config):
@@ -65,6 +73,12 @@ class Sim2sim:
 
         self.ctrl_lower = self.model.actuator_ctrlrange[:, 0]
         self.ctrl_upper = self.model.actuator_ctrlrange[:, 1]
+        # Resolve left hand body id for keyboard perturbation
+        self.perturb_body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "left_wrist_roll_link")
+        if self.perturb_body_id < 0:
+            print("[Warning] 'left_wrist_roll_link' body not found; arrow-key perturbation disabled.")
+        self._perturb_force = np.zeros(3, dtype=np.float64)
+
         # Initialize joint mapper for Real -> Mujoco conversion
         self.real_to_mujoco_mapper = create_real_to_mujoco_mapper(
             self.config.real_joint_names,
@@ -94,11 +108,15 @@ class Sim2sim:
         self.state_pub_thread = threading.Thread(target=self.state_pub_handler, daemon=False)
         self.cmd_sub = ChannelSubscriber(self.config.lowcmd_topic, LowCmdHG)
         self.cmd_sub.Init(self.cmd_sub_handler)
-        self.simulate_joystick_thread = threading.Thread(
-            target=listen_keyboard,
-            kwargs={"on_press": self.on_press, "on_release": self.on_release},
-            daemon=False
-        )
+        if sys.stdin.isatty():
+            self.simulate_joystick_thread = threading.Thread(
+                target=listen_keyboard,
+                kwargs={"on_press": self.on_press, "on_release": self.on_release},
+                daemon=False
+            )
+        else:
+            print("stdin is not a TTY; keyboard joystick simulation disabled.")
+            self.simulate_joystick_thread = threading.Thread(target=lambda: None, daemon=False)
         self.is_alive = True
         self.policy_queried = False
         self.loop_count = Value('i', 0)
@@ -128,19 +146,31 @@ class Sim2sim:
 
     def on_press(self, key):
         print(f'Key pressed: {key}')
+
+        # Joystick simulation
         joystick_btn = Keyboard2Joystick.get(key, None)
-        if joystick_btn is None:
+        if joystick_btn is not None:
+            joystick_idx = getattr(KeyMap, joystick_btn, None)
+            if joystick_idx is not None:
+                self.low_state.wireless_remote[0] = joystick_idx
+                self.state_pub.Write(self.low_state)
             return
-        joystick_idx = getattr(KeyMap, joystick_btn, None)
-        if joystick_idx is None:
-            return
-        self.low_state.wireless_remote[0] = joystick_idx
-        self.state_pub.Write(self.low_state)
+
+        # Arrow-key perturbation
+        if key in ArrowKeyForce and self.perturb_body_id >= 0:
+            self._perturb_force[:] = ArrowKeyForce[key]
+            print(f'Apply perturb force on left hand: {self._perturb_force}')
 
     def on_release(self, key):
         time.sleep(0.1)
-        self.low_state.wireless_remote[0] = 0
-        self.state_pub.Write(self.low_state)
+
+        if key in Keyboard2Joystick.values() or key in Keyboard2Joystick:
+            self.low_state.wireless_remote[0] = 0
+            self.state_pub.Write(self.low_state)
+
+        if key in ArrowKeyForce and self.perturb_body_id >= 0:
+            self._perturb_force[:] = 0.0
+            print('Clear perturb force')
 
     def cmd_sub_handler(self, msg):
         self.low_cmd = msg
@@ -181,26 +211,62 @@ class Sim2sim:
         while self.low_cmd is None:
             continue
         print(f'Connected to high level')
+        if self.args.auto_start:
+            self.low_state.wireless_remote[0] = KeyMap.start
+            self.state_pub.Write(self.low_state)
+            return
         print(f'Press "s" to move to default pose')
         running_zero_cmd = True
         while running_zero_cmd:
             running_zero_cmd = self.low_state.wireless_remote[0] != KeyMap.start
 
     def simulate_gantry(self):
-        print(
-            f'''Moving to default pose...\n'''
-            f'''Press "a" after the robot is in default pose to being control loop'''
-        )
+        if self.args.auto_start:
+            print('Auto-start: moving to default pose then starting control')
+        else:
+            print(
+                f'''Moving to default pose...\n'''
+                f'''Press "a" after the robot is in default pose to begin control loop'''
+            )
         timer = Timer(self.low_level_dt)
-        while True:
-            ptargets_mujoco = self.real_to_mujoco_mapper.map_action_from_to(self.__ptargets_real)
-            # gantry pose
+
+        # Gantry mode: hold root in air and smoothly drive joints to default pose.
+        # Do not blindly follow deploy's zero_cmd (which has q=0) to avoid snapping.
+        default_qpos_mujoco = self.real_to_mujoco_mapper.map_state_to_from(
+            np.array(self.config.default_qpos_real, dtype=np.float64)
+        )
+        start_qpos_mujoco = self.data.qpos[7:].copy()
+        transition_steps = 500  # ~1s at 500Hz
+
+        for step in range(transition_steps + 1):
+            alpha = step / transition_steps
             self.data.qpos[:7] = [0, 0, 2, 0.707, 0.0, 0.0, 0.707]
-            self.data.qpos[7:] = ptargets_mujoco
+            self.data.qpos[7:] = (1 - alpha) * start_qpos_mujoco + alpha * default_qpos_mujoco
+            self.data.qvel[:] = 0.
+            mujoco.mj_forward(self.model, self.data)
+            if not self._viewer_sync():
+                return
+            timer.sleep()
+
+        # Hold default pose until user presses A (or auto_start timeout)
+        gantry_hold_steps = 0
+        while True:
+            self.data.qpos[:7] = [0, 0, 2, 0.707, 0.0, 0.0, 0.707]
+            self.data.qpos[7:] = default_qpos_mujoco
+            self.data.qvel[:] = 0.
             mujoco.mj_forward(self.model, self.data)
 
             if not self._viewer_sync():
                 break
+
+            if self.args.auto_start:
+                gantry_hold_steps += 1
+                if gantry_hold_steps >= 500:  # ~1s hold at 500Hz
+                    self.low_state.wireless_remote[0] = KeyMap.A
+                    self.state_pub.Write(self.low_state)
+                    break
+                timer.sleep()
+                continue
 
             running_default_pos = self.low_state.wireless_remote[0] != KeyMap.A and self.low_state.wireless_remote[0] != KeyMap.B and self.low_state.wireless_remote[0] != KeyMap.X
             if not running_default_pos:
@@ -235,8 +301,12 @@ class Sim2sim:
 
             seconds = loop_count.value * self.low_level_dt
             
-            # Limit external forces applied via viewer to 30N
-            self._limit_external_forces(max_force=30.0)
+            # Apply keyboard perturbation force to left hand
+            if self.perturb_body_id >= 0:
+                self.data.xfrc_applied[self.perturb_body_id, :3] = self._perturb_force
+
+            # Limit external forces applied via viewer or keyboard
+            self._limit_external_forces(max_force=20.0)
             
             mujoco.mj_step(self.model, self.data)
 
@@ -309,8 +379,9 @@ class Sim2sim:
             return
         self.is_alive = False
 
-        self.on_press('x')
-        stop_listening()
+        if sys.stdin.isatty():
+            self.on_press('x')
+            stop_listening()
         if self.p_loop_rate is not None:
             self.p_loop_rate.terminate()
 
@@ -330,6 +401,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     default_xml = ASSETS_DIR / "g1" / "g1.xml"
     parser.add_argument("--xml_path", type=str, default=str(default_xml))
+    parser.add_argument("--auto_start", action='store_true', help='Skip manual start/A button presses for headless testing')
     args = parser.parse_args()
 
     config_path = Path(ASSETS_DIR).parents[0] / "config" / "controller.yaml"

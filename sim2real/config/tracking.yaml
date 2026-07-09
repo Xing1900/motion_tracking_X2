@@ -1,10 +1,10 @@
 # low latency
-policy_path: "assets/ckpts/G1TRACKING-03-16_14-15_0315.2/policy.onnx"
+policy_path: "assets/ckpts/x2_finetune_policy/policy.onnx"
 
 compliance_flag_value: 1.0 # 0.0 to disable compliance, 1.0 to enable compliance
 compliance_flag_threshold: 10.0 # 10.0 ~ 20.0
-future_steps: [0, 1, 2, 3, 4, -1, -2, -4, -8, -12, -16] # format: [0, ...future, ...history]
-motion_source: "vr"
+future_steps: [0, 1, 2, 3, 4, -1, -2, -4, -8, -12, -16] # student_future_steps from training; exported ONNX expects len=11
+motion_source: "udp"
 vr_req_addr: "tcp://127.0.0.1:28701"
 vr_rep_addr: "tcp://127.0.0.1:28702"
 vr_ctrl_addr: "tcp://127.0.0.1:28703"
@@ -21,71 +21,91 @@ prev_action_steps: 8
 switch_tail_keep_steps: 8 # keep old ref tail on motion switch; final keep is max(this, abs(min(future_steps)))
 
 motions:
-  - name: "dance1_subject1"
-    path: "assets/data/dance1_subject1.npz"
+  - name: "EKUT_300_PushStandTrans_06"
+    path: "assets/data/x2_motions/EKUT_300_PushStandTrans_06.npz"
     start: 0
     end: -1
-  - name: "dance2_subject1"
-    path: "assets/data/dance2_subject1.npz"
+  - name: "EKUT_300_PushStandStraight_09"
+    path: "assets/data/x2_motions/EKUT_300_PushStandStraight_09.npz"
     start: 0
     end: -1
-  - name: "fallAndGetUp1_subject1"
-    path: "assets/data/fallAndGetUp1_subject1.npz"
+  - name: "Transitions_mazen_c3d_punchboxing_jumpinplace"
+    path: "assets/data/x2_motions/Transitions_mazen_c3d_punchboxing_jumpinplace.npz"
     start: 0
     end: -1
-  - name: "fallAndGetUp2_subject2"
-    path: "assets/data/fallAndGetUp2_subject2.npz"
+  - name: "GRAB_s10_camera_takepicture_3"
+    path: "assets/data/x2_motions/GRAB_s10_camera_takepicture_3.npz"
     start: 0
     end: -1
-  - name: "fight1_subject2"
-    path: "assets/data/fight1_subject2.npz"
+  - name: "GRAB_s5_stanfordbunny_pass_1"
+    path: "assets/data/x2_motions/GRAB_s5_stanfordbunny_pass_1.npz"
     start: 0
     end: -1
-  - name: "fightAndSports1_subject1"
-    path: "assets/data/fightAndSports1_subject1.npz"
+  - name: "KIT_167_walking_slow03"
+    path: "assets/data/x2_motions/KIT_167_walking_slow03.npz"
     start: 0
     end: -1
-  - name: "jumps1_subject1"
-    path: "assets/data/jumps1_subject1.npz"
+  - name: "KIT_378_push_recovery_left02"
+    path: "assets/data/x2_motions/KIT_378_push_recovery_left02.npz"
     start: 0
     end: -1
-  - name: "run1_subject2"
-    path: "assets/data/run1_subject2.npz"
+  - name: "BMLrub_rub038_0017_lifting_light1"
+    path: "assets/data/x2_motions/BMLrub_rub038_0017_lifting_light1.npz"
     start: 0
     end: -1
-  - name: "run2_subject1"
-    path: "assets/data/run2_subject1.npz"
+  - name: "BMLrub_rub103_0014_knocking2"
+    path: "assets/data/x2_motions/BMLrub_rub103_0014_knocking2.npz"
     start: 0
     end: -1
-  - name: "sprint1_subject2"
-    path: "assets/data/sprint1_subject2.npz"
+  - name: "BMLrub_rub077_0018_lifting_light2"
+    path: "assets/data/x2_motions/BMLrub_rub077_0018_lifting_light2.npz"
     start: 0
     end: -1
-  - name: "walk1_subject1"
-    path: "assets/data/walk1_subject1.npz"
+  - name: "ACCAD_Male2Walking_c3d_B14_Walk_turn_right_45_t2"
+    path: "assets/data/x2_motions/ACCAD_Male2Walking_c3d_B14_Walk_turn_right_45_t2.npz"
     start: 0
     end: -1
-  - name: "walk2_subject1"
-    path: "assets/data/walk2_subject1.npz"
-    start: 0
-    end: -1
-  - name: "walk3_subject1"
-    path: "assets/data/walk3_subject1.npz"
+  - name: "CNRS_283_-12_R_2"
+    path: "assets/data/x2_motions/CNRS_283_-12_R_2.npz"
     start: 0
     end: -1
 motion_clips:
   - name: "default"
-    joint_pos: [-0.2800000011920929, 0.0, 0.0, 0.5, -0.23000000417232513, 0.0, -0.2800000011920929, 0.0, 0.0, 0.5, -0.23000000417232513, 0.0, 0.0, 0.0, 0.0, 0.3499999940395355, 0.1599999964237213, 0.0, 0.8700000047683716, 0.0, 0.0, 0.0, 0.3499999940395355, -0.1599999964237213, 0.0, 0.8700000047683716, 0.0, 0.0, 0.0]
+    joint_pos: [-0.28, 0.0, 0.0, 0.5, -0.23, 0.0, -0.28, 0.0, 0.0, 0.5, -0.23, 0.0, 0.0, 0.0, 0.0, 0.35, 0.16, 0.0, -0.87, 0.0, 0.0, 0.0, 0.35, -0.16, 0.0, -0.87, 0.0, 0.0, 0.0]
     root_quat: [1., 0., 0., 0.]
     root_pos: [0.0, 0.0, 0.78]
 
 action_clip: 10.0
 
-action_joint_names: ['left_hip_pitch_joint', 'right_hip_pitch_joint', 'waist_yaw_joint', 'left_hip_roll_joint', 'right_hip_roll_joint', 'waist_roll_joint', 'left_hip_yaw_joint', 'right_hip_yaw_joint', 'waist_pitch_joint', 'left_knee_joint', 'right_knee_joint', 'left_shoulder_pitch_joint', 'right_shoulder_pitch_joint', 'left_ankle_pitch_joint', 'right_ankle_pitch_joint', 'left_shoulder_roll_joint', 'right_shoulder_roll_joint', 'left_ankle_roll_joint', 'right_ankle_roll_joint', 'left_shoulder_yaw_joint', 'right_shoulder_yaw_joint', 'left_elbow_joint', 'right_elbow_joint', 'left_wrist_roll_joint', 'right_wrist_roll_joint', 'left_wrist_pitch_joint', 'right_wrist_pitch_joint', 'left_wrist_yaw_joint', 'right_wrist_yaw_joint']
+action_joint_names: [
+  "left_hip_pitch_joint", "left_hip_roll_joint", "left_hip_yaw_joint", "left_knee_joint", "left_ankle_pitch_joint", "left_ankle_roll_joint",
+  "right_hip_pitch_joint", "right_hip_roll_joint", "right_hip_yaw_joint", "right_knee_joint", "right_ankle_pitch_joint", "right_ankle_roll_joint",
+  "waist_yaw_joint", "waist_pitch_joint", "waist_roll_joint",
+  "left_shoulder_pitch_joint", "left_shoulder_roll_joint", "left_shoulder_yaw_joint", "left_elbow_joint",
+  "left_wrist_yaw_joint", "left_wrist_pitch_joint", "left_wrist_roll_joint",
+  "right_shoulder_pitch_joint", "right_shoulder_roll_joint", "right_shoulder_yaw_joint", "right_elbow_joint",
+  "right_wrist_yaw_joint", "right_wrist_pitch_joint", "right_wrist_roll_joint"
+]
 
-action_scale: [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 1.0, 1.0, 0.5, 0.5, 1.0, 1.0, 0.5, 0.5, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0] # AMASS model action scale
+action_scale: [
+  0.5, 0.5, 0.5, 0.5, 0.5, 0.5,
+  0.5, 0.5, 0.5, 0.5, 0.5, 0.5,
+  0.5, 0.5, 0.5,
+  1.0, 1.0, 1.0, 1.0,
+  1.0, 1.0, 1.0,
+  1.0, 1.0, 1.0, 1.0,
+  1.0, 1.0, 1.0
+]
 
-dataset_joint_names: ["left_hip_pitch_joint", "left_hip_roll_joint", "left_hip_yaw_joint", "left_knee_joint", "left_ankle_pitch_joint", "left_ankle_roll_joint", "right_hip_pitch_joint", "right_hip_roll_joint", "right_hip_yaw_joint", "right_knee_joint", "right_ankle_pitch_joint", "right_ankle_roll_joint", "waist_yaw_joint", "waist_roll_joint", "waist_pitch_joint", "left_shoulder_pitch_joint", "left_shoulder_roll_joint", "left_shoulder_yaw_joint", "left_elbow_joint", "left_wrist_roll_joint", "left_wrist_pitch_joint", "left_wrist_yaw_joint", "right_shoulder_pitch_joint", "right_shoulder_roll_joint", "right_shoulder_yaw_joint", "right_elbow_joint", "right_wrist_roll_joint", "right_wrist_pitch_joint", "right_wrist_yaw_joint"]
+dataset_joint_names: [
+  "left_hip_pitch_joint", "left_hip_roll_joint", "left_hip_yaw_joint", "left_knee_joint", "left_ankle_pitch_joint", "left_ankle_roll_joint",
+  "right_hip_pitch_joint", "right_hip_roll_joint", "right_hip_yaw_joint", "right_knee_joint", "right_ankle_pitch_joint", "right_ankle_roll_joint",
+  "waist_yaw_joint", "waist_pitch_joint", "waist_roll_joint",
+  "left_shoulder_pitch_joint", "left_shoulder_roll_joint", "left_shoulder_yaw_joint", "left_elbow_joint",
+  "left_wrist_yaw_joint", "left_wrist_pitch_joint", "left_wrist_roll_joint",
+  "right_shoulder_pitch_joint", "right_shoulder_roll_joint", "right_shoulder_yaw_joint", "right_elbow_joint",
+  "right_wrist_yaw_joint", "right_wrist_pitch_joint", "right_wrist_roll_joint"
+]
 
 kps_real: [
   # left leg
@@ -95,9 +115,9 @@ kps_real: [
   # waist
   40.17923847137318, 28.50124619574858, 28.50124619574858,
   # left arm
-  14.25062309787429, 14.25062309787429, 14.25062309787429, 14.25062309787429, 14.25062309787429, 8.611032447370201, 8.611032447370201,
+  14.25062309787429, 14.25062309787429, 14.25062309787429, 14.25062309787429, 14.25062309787429, 14.25062309787429, 14.25062309787429,
   # right arm
-  14.25062309787429, 14.25062309787429, 14.25062309787429, 14.25062309787429, 14.25062309787429, 8.611032447370201, 8.611032447370201,
+  14.25062309787429, 14.25062309787429, 14.25062309787429, 14.25062309787429, 14.25062309787429, 14.25062309787429, 14.25062309787429,
 ]
 
 kds_real: [
@@ -108,7 +128,7 @@ kds_real: [
   # waist
   2.5578897650279457, 1.814445686584846, 1.814445686584846,
   # left arm
-  0.907222843292423, 0.907222843292423, 0.907222843292423, 0.907222843292423, 0.907222843292423, 0.548195351665136, 0.548195351665136,
+  0.907222843292423, 0.907222843292423, 0.907222843292423, 0.907222843292423, 0.907222843292423, 0.907222843292423, 0.907222843292423,
   # right arm
-  0.907222843292423, 0.907222843292423, 0.907222843292423, 0.907222843292423, 0.907222843292423, 0.548195351665136, 0.548195351665136,
+  0.907222843292423, 0.907222843292423, 0.907222843292423, 0.907222843292423, 0.907222843292423, 0.907222843292423, 0.907222843292423,
 ]

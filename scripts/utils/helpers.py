@@ -178,20 +178,30 @@ def make_env_policy(cfg: DictConfig):
     aa.print("load checkpoint done")
 
     # Store checkpoint resume info in cfg so train.py can restore iteration/frames.
-    if "iter" in state_dict:
-        cfg.checkpoint_resume_iter = int(state_dict["iter"])
-    elif cfg.checkpoint_path is not None:
-        # Fallback for old checkpoints without iter metadata: parse from filename.
-        try:
-            from pathlib import Path
+    # Respect explicit command-line overrides (e.g. when starting a new stage from a previous checkpoint).
+    # The default config values are null, so we load from checkpoint whenever the user did not
+    # supply a concrete value.
+    if cfg.get("checkpoint_resume_iter") is None:
+        if "iter" in state_dict:
+            cfg.checkpoint_resume_iter = int(state_dict["iter"])
+        elif cfg.checkpoint_path is not None:
+            # Fallback for old checkpoints without iter metadata: parse from filename.
+            try:
+                from pathlib import Path
 
-            stem = Path(checkpoint_path).stem
-            if stem.startswith("checkpoint_"):
-                cfg.checkpoint_resume_iter = int(stem.split("_")[-1])
-        except Exception:
-            pass
-    if "env_frames" in state_dict:
-        cfg.checkpoint_resume_env_frames = int(state_dict["env_frames"])
+                stem = Path(checkpoint_path).stem
+                if stem.startswith("checkpoint_"):
+                    cfg.checkpoint_resume_iter = int(stem.split("_")[-1])
+            except Exception:
+                pass
+        if cfg.get("checkpoint_resume_iter") is None:
+            cfg.checkpoint_resume_iter = int(cfg.get("start_iter", 0))
+
+    if cfg.get("checkpoint_resume_env_frames") is None:
+        if "env_frames" in state_dict:
+            cfg.checkpoint_resume_env_frames = int(state_dict["env_frames"])
+        else:
+            cfg.checkpoint_resume_env_frames = 0
     
     policy_in_keys = cfg.algo.get("in_keys", ["policy", "priv"])
 

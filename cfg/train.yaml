@@ -17,6 +17,8 @@ eval_render: false
 save_interval: 150
 seed: 0
 checkpoint_path: null
+checkpoint_resume_iter: null
+checkpoint_resume_env_frames: null
 vecnorm: ${oc.select:algo.vecnorm,train}
 
 camera_follow: false

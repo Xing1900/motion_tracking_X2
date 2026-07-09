@@ -4,27 +4,39 @@ control_freq: 50
 lowcmd_topic: "rt/lowcmd"
 lowstate_topic: "rt/lowstate"
 
-render_gui: true          # Show real-time GUI for debugging
+render_gui: true          # Enable real-time MuJoCo GUI
 
 # state always has 29 dof
-isaac_joint_names_state: ['left_hip_pitch_joint', 'right_hip_pitch_joint', 'waist_yaw_joint', 'left_hip_roll_joint', 'right_hip_roll_joint', 'waist_roll_joint', 'left_hip_yaw_joint', 'right_hip_yaw_joint', 'waist_pitch_joint', 'left_knee_joint', 'right_knee_joint', 'left_shoulder_pitch_joint', 'right_shoulder_pitch_joint', 'left_ankle_pitch_joint', 'right_ankle_pitch_joint', 'left_shoulder_roll_joint', 'right_shoulder_roll_joint', 'left_ankle_roll_joint', 'right_ankle_roll_joint', 'left_shoulder_yaw_joint', 'right_shoulder_yaw_joint', 'left_elbow_joint', 'right_elbow_joint', 'left_wrist_roll_joint', 'right_wrist_roll_joint', 'left_wrist_pitch_joint', 'right_wrist_pitch_joint', 'left_wrist_yaw_joint', 'right_wrist_yaw_joint']
+isaac_joint_names_state: [
+  "left_hip_pitch_joint", "left_hip_roll_joint", "left_hip_yaw_joint", "left_knee_joint", "left_ankle_pitch_joint", "left_ankle_roll_joint",
+  "right_hip_pitch_joint", "right_hip_roll_joint", "right_hip_yaw_joint", "right_knee_joint", "right_ankle_pitch_joint", "right_ankle_roll_joint",
+  "waist_yaw_joint", "waist_pitch_joint", "waist_roll_joint",
+  "left_shoulder_pitch_joint", "left_shoulder_roll_joint", "left_shoulder_yaw_joint", "left_elbow_joint",
+  "left_wrist_yaw_joint", "left_wrist_pitch_joint", "left_wrist_roll_joint",
+  "right_shoulder_pitch_joint", "right_shoulder_roll_joint", "right_shoulder_yaw_joint", "right_elbow_joint",
+  "right_wrist_yaw_joint", "right_wrist_pitch_joint", "right_wrist_roll_joint"
+]
 
 # Real robot joint names
 real_joint_names: [
   "left_hip_pitch_joint", "left_hip_roll_joint", "left_hip_yaw_joint", "left_knee_joint", "left_ankle_pitch_joint", "left_ankle_roll_joint",
   "right_hip_pitch_joint", "right_hip_roll_joint", "right_hip_yaw_joint", "right_knee_joint", "right_ankle_pitch_joint", "right_ankle_roll_joint",
-  "waist_yaw_joint", "waist_roll_joint", "waist_pitch_joint",
-  "left_shoulder_pitch_joint", "left_shoulder_roll_joint", "left_shoulder_yaw_joint", "left_elbow_joint", "left_wrist_roll_joint", "left_wrist_pitch_joint", "left_wrist_yaw_joint",
-  "right_shoulder_pitch_joint", "right_shoulder_roll_joint", "right_shoulder_yaw_joint", "right_elbow_joint", "right_wrist_roll_joint", "right_wrist_pitch_joint", "right_wrist_yaw_joint"
+  "waist_yaw_joint", "waist_pitch_joint", "waist_roll_joint",
+  "left_shoulder_pitch_joint", "left_shoulder_roll_joint", "left_shoulder_yaw_joint", "left_elbow_joint",
+  "left_wrist_yaw_joint", "left_wrist_pitch_joint", "left_wrist_roll_joint",
+  "right_shoulder_pitch_joint", "right_shoulder_roll_joint", "right_shoulder_yaw_joint", "right_elbow_joint",
+  "right_wrist_yaw_joint", "right_wrist_pitch_joint", "right_wrist_roll_joint"
 ]
 
-# Mujoco joint names
+# Mujoco joint names - must match the order of joints in assets/x2/x2_ultra.xml qpos[7:]
 mujoco_joint_names: [
   "left_hip_pitch_joint", "left_hip_roll_joint", "left_hip_yaw_joint", "left_knee_joint", "left_ankle_pitch_joint", "left_ankle_roll_joint",
   "right_hip_pitch_joint", "right_hip_roll_joint", "right_hip_yaw_joint", "right_knee_joint", "right_ankle_pitch_joint", "right_ankle_roll_joint",
-  "waist_yaw_joint", "waist_roll_joint", "waist_pitch_joint",
-  "left_shoulder_pitch_joint", "left_shoulder_roll_joint", "left_shoulder_yaw_joint", "left_elbow_joint", "left_wrist_roll_joint", "left_wrist_pitch_joint", "left_wrist_yaw_joint",
-  "right_shoulder_pitch_joint", "right_shoulder_roll_joint", "right_shoulder_yaw_joint", "right_elbow_joint", "right_wrist_roll_joint", "right_wrist_pitch_joint", "right_wrist_yaw_joint"
+  "waist_yaw_joint", "waist_pitch_joint", "waist_roll_joint",
+  "left_shoulder_pitch_joint", "left_shoulder_roll_joint", "left_shoulder_yaw_joint", "left_elbow_joint",
+  "left_wrist_yaw_joint", "left_wrist_pitch_joint", "left_wrist_roll_joint",
+  "right_shoulder_pitch_joint", "right_shoulder_roll_joint", "right_shoulder_yaw_joint", "right_elbow_joint",
+  "right_wrist_yaw_joint", "right_wrist_pitch_joint", "right_wrist_roll_joint"
 ]
 
 
@@ -36,9 +48,9 @@ kps_real: [
   # waist
   40.17923847137318, 28.50124619574858, 28.50124619574858,
   # left arm
-  14.25062309787429, 14.25062309787429, 14.25062309787429, 14.25062309787429, 14.25062309787429, 8.611032447370201, 8.611032447370201,
+  14.25062309787429, 14.25062309787429, 14.25062309787429, 14.25062309787429, 14.25062309787429, 14.25062309787429, 14.25062309787429,
   # right arm
-  14.25062309787429, 14.25062309787429, 14.25062309787429, 14.25062309787429, 14.25062309787429, 8.611032447370201, 8.611032447370201,
+  14.25062309787429, 14.25062309787429, 14.25062309787429, 14.25062309787429, 14.25062309787429, 14.25062309787429, 14.25062309787429,
 ]
 
 kds_real: [
@@ -49,23 +61,23 @@ kds_real: [
   # waist
   2.5578897650279457, 1.814445686584846, 1.814445686584846,
   # left arm
-  0.907222843292423, 0.907222843292423, 0.907222843292423, 0.907222843292423, 0.907222843292423, 0.548195351665136, 0.548195351665136,
+  0.907222843292423, 0.907222843292423, 0.907222843292423, 0.907222843292423, 0.907222843292423, 0.907222843292423, 0.907222843292423,
   # right arm
-  0.907222843292423, 0.907222843292423, 0.907222843292423, 0.907222843292423, 0.907222843292423, 0.548195351665136, 0.548195351665136,
+  0.907222843292423, 0.907222843292423, 0.907222843292423, 0.907222843292423, 0.907222843292423, 0.907222843292423, 0.907222843292423,
 ]
 
 default_qpos_real: [
-  -0.28, 0, 0, 0.5, -0.23, 0,         # left leg
-  -0.28, 0, 0, 0.5, -0.23, 0,         # right leg
-  0, 0, 0,                  # waist
-  0.35, 0.16, 0, 0.87, 0, 0, 0,  # left arm
-  0.35, -0.16, 0, 0.87, 0, 0, 0, # right arm
+  -0.28, 0.0, 0.0, 0.5, -0.23, 0.0,         # left leg
+  -0.28, 0.0, 0.0, 0.5, -0.23, 0.0,         # right leg
+  0.0, 0.0, 0.0,                            # waist
+  0.35, 0.16, 0.0, -0.87, 0.0, 0.0, 0.0,   # left arm
+  0.35, -0.16, 0.0, -0.87, 0.0, 0.0, 0.0,  # right arm
 ]
 
 init_qpos_real: [
-  -0.28, 0, 0, 0.5, -0.23, 0,         # left leg
-  -0.28, 0, 0, 0.5, -0.23, 0,         # right leg
-  0, 0, 0,                  # waist
-  0.35, 0.16, 0, 0.87, 0, 0, 0,  # left arm
-  0.35, -0.16, 0, 0.87, 0, 0, 0, # right arm
+  -0.28, 0.0, 0.0, 0.5, -0.23, 0.0,         # left leg
+  -0.28, 0.0, 0.0, 0.5, -0.23, 0.0,         # right leg
+  0.0, 0.0, 0.0,                            # waist
+  0.35, 0.16, 0.0, -0.87, 0.0, 0.0, 0.0,   # left arm
+  0.35, -0.16, 0.0, -0.87, 0.0, 0.0, 0.0,  # right arm
 ]

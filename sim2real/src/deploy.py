@@ -37,6 +37,8 @@ class Controller:
         self.args = args
         self.config = ctrl_cfg
         self.remote_controller = RemoteController()
+        if getattr(self.args, 'auto_start', False):
+            self.remote_controller.button[KeyMap.start] = 1
         self.control_dt = 1.0 / self.config.control_freq
 
         self.isaac_to_real_mapper_state = create_isaac_to_real_mapper(
@@ -136,8 +138,14 @@ class Controller:
 
     def zero_torque_state(self):
         print("Enter zero torque state.")
-        print("Waiting for the start signal...")
+        if getattr(self.args, 'auto_start', False):
+            print("Auto-start: skipping start signal wait")
+        else:
+            print("Waiting for the start signal...")
         while self.remote_controller.button[KeyMap.start] != 1:
+            if getattr(self.args, 'auto_start', False):
+                self.remote_controller.button[KeyMap.start] = 1
+                break
             self.process_state()
             create_zero_cmd(self.low_cmd)
             self.send_cmd(self.low_cmd)
@@ -167,7 +175,10 @@ class Controller:
     def default_qpos_state(self):
         initial_policy: Optional[Policy] = None
 
-        print("Press A to tracking policy...")
+        if getattr(self.args, 'auto_start', False):
+            print("Auto-start: selecting tracking policy")
+        else:
+            print("Press A to tracking policy...")
 
         while True:
             self.process_state()
@@ -187,6 +198,11 @@ class Controller:
             if self.btn_rise[KeyMap.A]:
                 initial_policy = self.policies["tracking"]
                 print("Initial policy: tracking")
+                break
+
+            if getattr(self.args, 'auto_start', False) and initial_policy is None:
+                initial_policy = self.policies["tracking"]
+                print("Initial policy: tracking (auto-start)")
                 break
 
         self.current_policy = initial_policy
@@ -252,6 +268,8 @@ class Controller:
                 self.send_cmd(self.low_cmd)
                 loop_count.value += 1
                 self.policy_step += 1
+                if self.policy_step % 500 == 0:
+                    print(f'[run] policy_step={self.policy_step}, action_mean={action_real.mean():.3f}')
                 timer.sleep()
         finally:
             pass
@@ -271,6 +289,7 @@ if __name__ == "__main__":
     parser.add_argument("--net", type=str, default=None)
     parser.add_argument("--sim2sim", action='store_true')
     parser.add_argument("--real", action='store_true')
+    parser.add_argument("--auto_start", action='store_true', help='Skip manual start/A button presses for headless testing')
     args = parser.parse_args()
     assert args.sim2sim ^ args.real, "Please specify either sim2sim or real."
 

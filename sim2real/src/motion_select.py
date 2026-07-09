@@ -102,6 +102,8 @@ def main():
                         help="YAML config file containing motions & motion_clips. If omitted, built-in example is used.")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=28562)
+    parser.add_argument("--send", type=str, default=None,
+                        help="Non-interactively send a single motion name and exit.")
     args = parser.parse_args()
 
     # If no YAML path provided, allow pasting inline later; but we still try to load if present
@@ -144,6 +146,16 @@ def main():
     try_load()
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+    if args.send is not None:
+        ok, name, msg = resolve_choice(args.send, options)
+        if not ok:
+            print(f"[ERROR] {msg}")
+            sys.exit(1)
+        if send_udp(name, args.host, args.port, sock):
+            print(f"Sent '{name}'. Exiting.")
+        sys.exit(0)
+
     print(BANNER)
 
     last_choice = None
