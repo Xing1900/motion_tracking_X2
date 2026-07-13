@@ -21,6 +21,10 @@ prev_action_steps: 8
 switch_tail_keep_steps: 8 # keep old ref tail on motion switch; final keep is max(this, abs(min(future_steps)))
 
 motions:
+  - name: "Subject_61_F_3"
+    path: "/home/liuguoxing/Documents/dataset_new/retarget_x2_npz/AMASS/BMLmovi/Subject_61_F_MoSh/Subject_61_F_3_stageii.npz"
+    start: 0
+    end: -1
   - name: "EKUT_300_PushStandTrans_06"
     path: "assets/data/x2_motions/EKUT_300_PushStandTrans_06.npz"
     start: 0
@@ -71,7 +75,7 @@ motions:
     end: -1
 motion_clips:
   - name: "default"
-    joint_pos: [-0.28, 0.0, 0.0, 0.5, -0.23, 0.0, -0.28, 0.0, 0.0, 0.5, -0.23, 0.0, 0.0, 0.0, 0.0, 0.35, 0.16, 0.0, -0.87, 0.0, 0.0, 0.0, 0.35, -0.16, 0.0, -0.87, 0.0, 0.0, 0.0]
+    joint_pos: [-0.28, 0.0, 0.0, 0.5, -0.23, 0.0, -0.28, 0.0, 0.0, 0.5, -0.23, 0.0, 0.0, 0.0, 0.0, 0.35, 0.16, 0.0, 0.87, 0.0, 0.0, 0.0, 0.35, -0.16, 0.0, 0.87, 0.0, 0.0, 0.0]
     root_quat: [1., 0., 0., 0.]
     root_pos: [0.0, 0.0, 0.78]
 

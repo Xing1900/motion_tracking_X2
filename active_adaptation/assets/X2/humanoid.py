@@ -100,7 +100,7 @@ X2_INIT_STATE = EntityCfg.InitialStateCfg(
         ".*_hip_pitch_joint": -0.28,
         ".*_knee_joint": 0.5,
         ".*_ankle_pitch_joint": -0.23,
-        ".*_elbow_joint": -0.87,
+        ".*_elbow_joint": 0.87,
         "left_shoulder_roll_joint": 0.16,
         "left_shoulder_pitch_joint": 0.35,
         "right_shoulder_roll_joint": -0.16,
