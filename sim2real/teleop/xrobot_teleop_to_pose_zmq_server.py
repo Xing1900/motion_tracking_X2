@@ -109,7 +109,7 @@ class _RetargetWorkerRuntime:
         self._quat_mul_np = worker_quat_mul_np
         self.retarget = GeneralMotionRetargeting(
             src_human="xrobot",
-            tgt_robot="unitree_g1",
+            tgt_robot=str(worker_config.get("robot", "unitree_g1")),
             actual_human_height=float(worker_config["actual_human_height"]),
         )
         self.retarget.max_iter = int(worker_config["gmr_max_iter"])
@@ -1018,6 +1018,7 @@ class LowLatencyTeleopPoseZMQServer:
         self.raw_recv_conn, self.raw_send_conn = self.mp_ctx.Pipe(duplex=False)
         self.result_recv_conn, self.result_send_conn = self.mp_ctx.Pipe(duplex=False)
         worker_config = {
+            "robot": str(self.args.robot),
             "actual_human_height": float(self.args.actual_human_height),
             "gmr_max_iter": int(self.gmr_max_iter),
             "send_human_motion": bool(self.args.visualize),
@@ -1178,7 +1179,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Low-latency ZMQ teleop pose server")
     parser.add_argument(
         "--robot",
-        choices=["unitree_g1", "unitree_g1_with_hands"],
+        choices=["unitree_g1", "unitree_g1_with_hands", "agibot_x2"],
         default="unitree_g1",
         help="Robot key for defaults",
     )

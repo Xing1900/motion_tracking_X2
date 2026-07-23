@@ -45,7 +45,52 @@ DEFAULT_MIMIC_OBS_G1 = np.concatenate(
 )
 
 
+DEFAULT_MIMIC_OBS_X2 = np.concatenate(
+    [
+        np.array([0.0, 0.0], dtype=np.float32),  # xy velocity
+        np.array([0.78], dtype=np.float32),  # root z
+        np.array([0.0, 0.0], dtype=np.float32),  # roll / pitch
+        np.array([0.0], dtype=np.float32),  # yaw angular velocity
+        np.array(
+            [
+                -0.28,
+                0.0,
+                0.0,
+                0.5,
+                -0.23,
+                0.0,
+                -0.28,
+                0.0,
+                0.0,
+                0.5,
+                -0.23,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.35,
+                0.16,
+                0.0,
+                0.87,
+                0.0,
+                0.0,
+                0.0,
+                0.35,
+                -0.16,
+                0.0,
+                0.87,
+                0.0,
+                0.0,
+                0.0,
+            ],
+            dtype=np.float32,
+        ),
+    ]
+)
+
+
 DEFAULT_MIMIC_OBS = {
     "unitree_g1": DEFAULT_MIMIC_OBS_G1,
     "unitree_g1_with_hands": DEFAULT_MIMIC_OBS_G1,
+    "agibot_x2": DEFAULT_MIMIC_OBS_X2,
 }
