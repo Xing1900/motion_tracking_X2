@@ -13,6 +13,7 @@ Architecture:
 import argparse
 import json
 import multiprocessing as mp
+import queue
 import threading
 import time
 from collections import deque
@@ -232,6 +233,7 @@ class _RetargetWorkerRuntime:
             "type": "retarget_result",
             "seq": int(packet["seq"]),
             "recv_ns": int(packet["recv_ns"]),
+            "source_timestamp_ns": packet.get("source_timestamp_ns"),
             "qpos": qpos_curr.astype(np.float32, copy=True),
             "human_motion_data": self._copy_human_motion_data(self.retarget.scaled_human_data)
             if self.send_human_motion
@@ -344,6 +346,24 @@ class LowLatencyTeleopPoseZMQServer:
         self.rep_sock = None
         self.ctrl_sock = None
 
+        # A recorder must not attach another PULL socket to rep/ctrl: ZeroMQ
+        # PUSH/PULL load-balances messages and the recorder would steal frames
+        # from the controller.  The tap is an independent PUB channel.  All
+        # producers enqueue lightweight events; one dedicated thread owns the
+        # PUB socket so XR/retarget/control callbacks are never blocked by I/O.
+        self.tap_bind_addr = str(args.tap_bind_addr).strip()
+        self.tap_accepting = bool(self.tap_bind_addr)
+        self.tap_queue: queue.Queue[tuple[str, Dict[str, Any]]] = queue.Queue(
+            maxsize=max(1, int(args.tap_queue_size))
+        )
+        self.tap_stats_lock = threading.Lock()
+        self.tap_next_seq = 0
+        self.tap_enqueued_count = 0
+        self.tap_sent_count = 0
+        self.tap_queue_drop_count = 0
+        self.tap_send_drop_count = 0
+        self.tap_prepare_drop_count = 0
+
         self.default_qpos = self._build_default_qpos()
         self.last_controller_buttons: Dict[str, Any] = self._default_controller_buttons()
 
@@ -361,6 +381,9 @@ class LowLatencyTeleopPoseZMQServer:
         self.latest_vr_recv_ns: int = 0
         self.latest_vr_seq: int = 0
         self.latest_vr_motion_timestamp_ns: Optional[int] = None
+        self.latest_controller_source_timestamp_ns: Optional[int] = None
+        self.latest_controller_recv_monotonic_ns: int = 0
+        self.latest_controller_recv_wall_time_ns: int = 0
 
         self.retarget_buffer_lock = threading.Lock()
         self.retarget_buffer: deque[RetargetedFrame] = deque()
@@ -402,6 +425,7 @@ class LowLatencyTeleopPoseZMQServer:
         self.worker_result_thread = None
         self.request_thread = None
         self.control_thread = None
+        self.tap_thread = None
         self.stats_thread = None
         self.visualization_thread = None
 
@@ -507,6 +531,58 @@ class LowLatencyTeleopPoseZMQServer:
         }
 
     @staticmethod
+    def _copy_pose_list(poses: Any) -> Optional[list[list[float]]]:
+        if not isinstance(poses, (list, tuple)):
+            return None
+        copied: list[list[float]] = []
+        for pose in poses:
+            if not isinstance(pose, (list, tuple)) or len(pose) < 7:
+                return None
+            copied.append([float(value) for value in pose[:7]])
+        return copied
+
+    @staticmethod
+    def _copy_numeric_list(values: Any) -> Optional[list[float]]:
+        if not isinstance(values, (list, tuple)):
+            return None
+        try:
+            return [float(value) for value in values]
+        except (TypeError, ValueError):
+            return None
+
+    def _enqueue_tap(self, topic: str, payload: Dict[str, Any]) -> None:
+        if not self.tap_accepting:
+            return
+
+        event = {
+            "tap_schema_version": 1,
+            "type": str(topic),
+            "bridge_enqueue_monotonic_ns": time.monotonic_ns(),
+            "bridge_enqueue_wall_time_ns": time.time_ns(),
+            **payload,
+        }
+        # Assign sequence and enqueue under one short lock so events from
+        # different producer threads cannot enter the queue out of seq order.
+        with self.tap_stats_lock:
+            event["tap_seq"] = self.tap_next_seq
+            self.tap_next_seq += 1
+            try:
+                self.tap_queue.put_nowait((str(topic), event))
+                self.tap_enqueued_count += 1
+            except queue.Full:
+                self.tap_queue_drop_count += 1
+
+    def _count_tap_prepare_drop(self) -> None:
+        """Account for a tap payload that could not be prepared.
+
+        This intentionally does not log from XR/control callbacks: recorder
+        diagnostics must never add blocking I/O to the realtime path.
+        """
+
+        with self.tap_stats_lock:
+            self.tap_prepare_drop_count += 1
+
+    @staticmethod
     def _serialize_qpos_frame(qpos: np.ndarray) -> Dict[str, Any]:
         q = np.asarray(qpos, dtype=np.float32).reshape(-1)
         return {
@@ -517,6 +593,7 @@ class LowLatencyTeleopPoseZMQServer:
 
     def _on_vr_frame(self, snapshot: dict) -> None:
         recv_ns = time.monotonic_ns()
+        recv_wall_time_ns = time.time_ns()
         controller_buttons = self._extract_controller_buttons_from_snapshot(snapshot)
         top_timestamp_ns = None
         try:
@@ -534,8 +611,12 @@ class LowLatencyTeleopPoseZMQServer:
         motion_timestamp_ns = body_timestamp_ns if body_timestamp_ns not in (None, 0) else top_timestamp_ns
 
         should_wake_retarget = False
+        vr_seq = 0
         with self.latest_vr_lock:
             self.last_controller_buttons = controller_buttons
+            self.latest_controller_source_timestamp_ns = top_timestamp_ns
+            self.latest_controller_recv_monotonic_ns = recv_ns
+            self.latest_controller_recv_wall_time_ns = recv_wall_time_ns
             self.callback_count += 1
             if body_available and motion_timestamp_ns is not None:
                 if self.latest_vr_motion_timestamp_ns != motion_timestamp_ns:
@@ -544,8 +625,31 @@ class LowLatencyTeleopPoseZMQServer:
                     self.latest_vr_seq += 1
                     self.latest_vr_motion_timestamp_ns = motion_timestamp_ns
                     should_wake_retarget = True
+            vr_seq = self.latest_vr_seq
         if should_wake_retarget:
+            # Wake the control path before doing any recorder-only copying.
             self.vr_frame_event.set()
+            if self.tap_accepting:
+                try:
+                    body_poses = self._copy_pose_list(body.get("poses", None))
+                    headset_pose = self._copy_numeric_list(
+                        snapshot.get("headset_pose", None) if isinstance(snapshot, dict) else None
+                    )
+                    self._enqueue_tap(
+                        "xr",
+                        {
+                            "seq": int(vr_seq),
+                            "sdk_timestamp_ns": top_timestamp_ns,
+                            "body_source_timestamp_ns": motion_timestamp_ns,
+                            "bridge_recv_monotonic_ns": int(recv_ns),
+                            "bridge_recv_wall_time_ns": int(recv_wall_time_ns),
+                            "body_poses_xyz_xyzw": body_poses,
+                            "headset_pose": headset_pose,
+                            "controller_buttons": controller_buttons,
+                        },
+                    )
+                except Exception:
+                    self._count_tap_prepare_drop()
 
     def _append_retarget_frame(self, recv_ns: int, qpos: np.ndarray) -> None:
         cutoff_ns = recv_ns - self.retarget_buffer_window_ns
@@ -738,6 +842,7 @@ class LowLatencyTeleopPoseZMQServer:
                     poses = self.latest_vr_poses
                     recv_ns = self.latest_vr_recv_ns
                     seq = self.latest_vr_seq
+                    source_timestamp_ns = self.latest_vr_motion_timestamp_ns
 
                 if poses is None or seq == last_sent_seq:
                     with self.latest_vr_lock:
@@ -760,6 +865,7 @@ class LowLatencyTeleopPoseZMQServer:
                         {
                             "seq": int(seq),
                             "recv_ns": int(recv_ns),
+                            "source_timestamp_ns": source_timestamp_ns,
                             "poses": poses,
                         }
                     )
@@ -813,6 +919,20 @@ class LowLatencyTeleopPoseZMQServer:
             recv_ns = int(payload["recv_ns"])
             self._append_retarget_frame(recv_ns=recv_ns, qpos=qpos_curr)
             self.retarget_count += 1
+            if self.tap_accepting:
+                try:
+                    self._enqueue_tap(
+                        "retarget",
+                        {
+                            "seq": int(payload.get("seq", 0)),
+                            "body_source_timestamp_ns": payload.get("source_timestamp_ns"),
+                            "bridge_recv_monotonic_ns": int(recv_ns),
+                            "qpos_root_xyz_quat_wxyz_dof": qpos_curr[:36].tolist(),
+                            "dropped_before_process": dropped_before_process,
+                        },
+                    )
+                except Exception:
+                    self._count_tap_prepare_drop()
 
             if self.viewer is not None:
                 with self.vis_lock:
@@ -914,6 +1034,28 @@ class LowLatencyTeleopPoseZMQServer:
                 print("[Warning] reply queue full, drop one reply")
             except Exception as exc:
                 print(f"[Warning] reply send failed: {exc}")
+            else:
+                if self.tap_accepting:
+                    try:
+                        self._enqueue_tap(
+                            "reference",
+                            {
+                                "bridge_recv_monotonic_ns": int(req_recv_ns),
+                                "request_start": bool(req.get("start", False)),
+                                "frame_seq_start": seq_start,
+                                "frame_dt_ns": int(round(1e9 / float(self.ctrl_fps))),
+                                "no_interp_applied": bool(used_fallback),
+                                "sample_mode": sample_info.get("mode"),
+                                "sample_target_monotonic_ns": sample_info.get("target_ns"),
+                                "retarget_age_ms": retarget_age_ms,
+                                "frames_qpos_root_xyz_quat_wxyz_dof": [
+                                    np.asarray(frame, dtype=np.float32).reshape(-1)[:36].tolist()
+                                    for frame in out_frames
+                                ],
+                            },
+                        )
+                    except Exception:
+                        self._count_tap_prepare_drop()
 
     def _stats_loop(self) -> None:
         while not self.stop_event.is_set():
@@ -933,6 +1075,11 @@ class LowLatencyTeleopPoseZMQServer:
             raw_motion_drop_count = int(self.raw_motion_drop_count)
             latest_merged_reqs = int(self.latest_merged_reqs)
             latest_req_dt_ms = self.latest_req_dt_ms
+            with self.tap_stats_lock:
+                tap_sent_count = self.tap_sent_count
+                tap_queue_drop_count = self.tap_queue_drop_count
+                tap_send_drop_count = self.tap_send_drop_count
+                tap_prepare_drop_count = self.tap_prepare_drop_count
 
             alpha = info.get("alpha")
             alpha_str = "None" if alpha is None else f"{float(alpha):.3f}"
@@ -942,6 +1089,8 @@ class LowLatencyTeleopPoseZMQServer:
                 f"req={req_count}, rep={reply_count}, rep_drop={reply_drop_count}, "
                 f"req_merged_total={req_merged_total}, latest_merged={latest_merged_reqs}, "
                 f"fallback={fallback_count}, raw_drop={raw_motion_drop_count}, "
+                f"tap_sent={tap_sent_count}, tap_queue_drop={tap_queue_drop_count}, "
+                f"tap_send_drop={tap_send_drop_count}, tap_prepare_drop={tap_prepare_drop_count}, "
                 f"cb={callback_count}, retarget={retarget_count}, "
                 f"mode={info.get('mode')}, buffer={info.get('buffer_len')}, "
                 f"latest_req_dt_ms={req_dt_str}, "
@@ -960,6 +1109,9 @@ class LowLatencyTeleopPoseZMQServer:
         while not self.stop_event.is_set():
             with self.latest_vr_lock:
                 buttons = dict(self.last_controller_buttons)
+                controller_source_timestamp_ns = self.latest_controller_source_timestamp_ns
+                controller_last_update_ns = self.latest_controller_recv_monotonic_ns
+                controller_last_update_wall_time_ns = self.latest_controller_recv_wall_time_ns
 
             payload = {
                 "t_ms": int(time.time() * 1000),
@@ -972,7 +1124,79 @@ class LowLatencyTeleopPoseZMQServer:
             except Exception as exc:
                 print(f"[Warning] control send failed: {exc}")
 
+            if self.tap_accepting:
+                sample_ns = time.monotonic_ns()
+                try:
+                    self._enqueue_tap(
+                        "controller",
+                        {
+                            "bridge_sample_monotonic_ns": sample_ns,
+                            "bridge_sample_wall_time_ns": time.time_ns(),
+                            "controller_source_timestamp_ns": controller_source_timestamp_ns,
+                            "controller_last_update_monotonic_ns": controller_last_update_ns or None,
+                            "controller_last_update_wall_time_ns": controller_last_update_wall_time_ns or None,
+                            "controller_age_ms": (
+                                None
+                                if controller_last_update_ns <= 0
+                                else (sample_ns - controller_last_update_ns) / 1e6
+                            ),
+                            "controller_buttons": buttons,
+                        },
+                    )
+                except Exception:
+                    self._count_tap_prepare_drop()
+
             self.stop_event.wait(timeout=period_s)
+
+    def _tap_publisher_loop(self) -> None:
+        if not self.tap_bind_addr:
+            return
+
+        import zmq
+
+        tap_sock = self.zmq_context.socket(zmq.PUB)
+        tap_sock.setsockopt(zmq.LINGER, 0)
+        tap_sock.setsockopt(zmq.SNDHWM, max(100, self.tap_queue.maxsize))
+        try:
+            tap_sock.bind(self.tap_bind_addr)
+            print(f"[teleop_tap] publishing recorder events at {self.tap_bind_addr}")
+            while not self.stop_event.is_set() or not self.tap_queue.empty():
+                try:
+                    topic, event = self.tap_queue.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+
+                try:
+                    tap_sock.send_multipart(
+                        [
+                            topic.encode("utf-8"),
+                            json.dumps(event, separators=(",", ":")).encode("utf-8"),
+                        ],
+                        flags=zmq.NOBLOCK,
+                    )
+                    with self.tap_stats_lock:
+                        self.tap_sent_count += 1
+                except zmq.Again:
+                    with self.tap_stats_lock:
+                        self.tap_send_drop_count += 1
+                except Exception as exc:
+                    with self.tap_stats_lock:
+                        self.tap_send_drop_count += 1
+                    print(f"[Warning] recorder tap send failed: {exc}")
+                finally:
+                    self.tap_queue.task_done()
+        except Exception as exc:
+            self.tap_accepting = False
+            while True:
+                try:
+                    self.tap_queue.get_nowait()
+                    self.tap_queue.task_done()
+                except queue.Empty:
+                    break
+            print(f"[Warning] recorder tap disabled: failed to bind {self.tap_bind_addr}: {exc}")
+        finally:
+            self.tap_accepting = False
+            tap_sock.close(0)
 
     def _visualization_loop(self) -> None:
         if self.viewer is None:
@@ -1068,6 +1292,7 @@ class LowLatencyTeleopPoseZMQServer:
         print(f"  req_bind_addr: {self.args.req_bind_addr}")
         print(f"  rep_bind_addr: {self.args.rep_bind_addr}")
         print(f"  ctrl_bind_addr: {self.args.ctrl_bind_addr}")
+        print(f"  tap_bind_addr: {self.tap_bind_addr or '<disabled>'}")
         print(f"  ctrl_fps: {self.ctrl_fps}")
         print(f"  gmr_max_iter: {self.gmr_max_iter}")
         print("  chunk_size: fixed to 1 frame per reply")
@@ -1100,6 +1325,12 @@ class LowLatencyTeleopPoseZMQServer:
             name="teleop-control",
             daemon=True,
         )
+        if self.tap_bind_addr:
+            self.tap_thread = threading.Thread(
+                target=self._tap_publisher_loop,
+                name="teleop-tap-publisher",
+                daemon=True,
+            )
         if self.viewer is not None:
             self.visualization_thread = threading.Thread(
                 target=self._visualization_loop,
@@ -1113,6 +1344,8 @@ class LowLatencyTeleopPoseZMQServer:
                 daemon=True,
             )
 
+        if self.tap_thread is not None:
+            self.tap_thread.start()
         self.raw_sender_thread.start()
         self.worker_result_thread.start()
         self.request_thread.start()
@@ -1140,6 +1373,7 @@ class LowLatencyTeleopPoseZMQServer:
                 self.worker_result_thread,
                 self.request_thread,
                 self.control_thread,
+                self.tap_thread,
                 self.visualization_thread,
                 self.stats_thread,
             ):
@@ -1207,6 +1441,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--req_bind_addr", type=str, default="tcp://*:28701")
     parser.add_argument("--rep_bind_addr", type=str, default="tcp://*:28702")
     parser.add_argument("--ctrl_bind_addr", type=str, default="tcp://*:28703")
+    parser.add_argument(
+        "--tap_bind_addr",
+        type=str,
+        default="",
+        help=(
+            "Independent PUB endpoint for recorder events (disabled by default). "
+            "Recorders must use this tap instead of attaching to rep/ctrl PUSH sockets."
+        ),
+    )
+    parser.add_argument(
+        "--tap_queue_size",
+        type=int,
+        default=2048,
+        help="Bounded recorder-tap queue; full queues drop events instead of blocking teleop",
+    )
     parser.add_argument("--min_link_height", type=float, default=0.0)
     parser.add_argument(
         "--min_link_height_align_strategy",

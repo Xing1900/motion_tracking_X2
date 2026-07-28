@@ -270,3 +270,12 @@ More concretely:
 - On a teleop start event, `sim2real` uses the first returned frame to align the live XR reference stream to its current anchor pose, then blends into the live stream.
 - During steady-state teleop, `sim2real` keeps the buffer above its waterline by repeatedly requesting new chunks before the future horizon runs out.
 - The bridge may interpolate between the previously sent pose and the newest retargeted pose for non-start replies, which reduces discontinuities in the returned chunk.
+
+## X2 demonstration recording
+
+For data collection, start the bridge with
+`--tap_bind_addr tcp://*:28704`, then use the independent recorder documented
+in [`../data_collection/README.md`](../data_collection/README.md).  Do not run
+`record_teleop_retarget_zmq.py` alongside the C++ controller: it attaches a
+second PULL consumer to the control PUSH/PULL channels and can steal live
+reference/button messages.
