@@ -184,6 +184,10 @@ python convert_to_lerobot.py \
   --fps 25
 ```
 
+The X2 head camera is mounted upside down for this stream, so conversion rotates
+frames by 180 degrees by default. Raw compressed images remain unchanged. Pass
+`--camera_rotation_deg 0` if the camera publisher has already corrected them.
+
 Use `--require_success` after the episodes have been annotated.  The converter
 produces:
 

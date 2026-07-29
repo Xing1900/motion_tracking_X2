@@ -132,6 +132,28 @@ class RawEpisodeManagerTest(unittest.TestCase):
 
 
 class ConversionTest(unittest.TestCase):
+    def test_decoded_camera_can_be_rotated_180_degrees(self):
+        try:
+            import cv2
+        except ImportError as exc:
+            self.skipTest(str(exc))
+
+        rgb = np.array(
+            [
+                [[255, 0, 0], [0, 255, 0]],
+                [[0, 0, 255], [255, 255, 0]],
+            ],
+            dtype=np.uint8,
+        )
+        ok, encoded = cv2.imencode(".png", cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+        self.assertTrue(ok)
+        with tempfile.TemporaryDirectory() as temporary:
+            image_path = Path(temporary) / "corners.png"
+            image_path.write_bytes(encoded.tobytes())
+            rotated = _decode_rgb(image_path, rotation_deg=180)
+
+        np.testing.assert_array_equal(rotated, np.rot90(rgb, 2))
+
     def test_synchronizes_reference_joint_imu_and_camera(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

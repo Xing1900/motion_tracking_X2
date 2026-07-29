@@ -283,16 +283,21 @@ class PreviousEventSeries:
         return self.events[index], (target_ns - self.times[index]) / 1e6
 
 
-def _decode_rgb(image_path: Path) -> np.ndarray:
+def _decode_rgb(image_path: Path, *, rotation_deg: int = 0) -> np.ndarray:
     try:
         import cv2
     except ImportError as exc:
         raise ImportError("opencv-python is required to decode raw camera frames") from exc
+    if rotation_deg not in (0, 180):
+        raise ValueError("camera rotation must be 0 or 180 degrees")
     encoded = np.fromfile(image_path, dtype=np.uint8)
     bgr = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
     if bgr is None:
         raise ValueError(f"Failed to decode camera frame: {image_path}")
-    return np.ascontiguousarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB), dtype=np.uint8)
+    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    if rotation_deg == 180:
+        rgb = cv2.rotate(rgb, cv2.ROTATE_180)
+    return np.ascontiguousarray(rgb, dtype=np.uint8)
 
 
 def _validate_manifest(manifest: Dict[str, Any], episode_dir: Path) -> None:
@@ -329,6 +334,8 @@ def split_contiguous_samples(
 
 def _validate_segment_images(
     segments: Sequence[tuple[str, Sequence[ConvertedSample]]],
+    *,
+    camera_rotation_deg: int,
 ) -> tuple[int, int, int]:
     first_shape: Optional[tuple[int, int, int]] = None
     decoded_paths: set[Path] = set()
@@ -336,7 +343,9 @@ def _validate_segment_images(
         for sample in samples:
             if sample.image_path in decoded_paths:
                 continue
-            rgb = _decode_rgb(sample.image_path)
+            rgb = _decode_rgb(
+                sample.image_path, rotation_deg=camera_rotation_deg
+            )
             shape = tuple(rgb.shape)
             if first_shape is None:
                 first_shape = shape
@@ -570,6 +579,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_joint_age_ms", type=float, default=100.0)
     parser.add_argument("--max_imu_age_ms", type=float, default=100.0)
     parser.add_argument(
+        "--camera_rotation_deg",
+        type=int,
+        choices=(0, 180),
+        default=180,
+        help="Rotate decoded head-camera frames before writing the dataset",
+    )
+    parser.add_argument(
         "--min_segment_frames",
         type=int,
         default=2,
@@ -640,7 +656,10 @@ def main() -> None:
         f"short_fragment_frames_dropped={short_fragment_frames}"
     )
 
-    first_shape = _validate_segment_images(output_segments)
+    first_shape = _validate_segment_images(
+        output_segments,
+        camera_rotation_deg=args.camera_rotation_deg,
+    )
     if args.dry_run:
         first_sample = output_segments[0][1][0]
         print(
@@ -673,7 +692,10 @@ def main() -> None:
     try:
         for task, segment in output_segments:
             for sample in segment:
-                rgb = _decode_rgb(sample.image_path)
+                rgb = _decode_rgb(
+                    sample.image_path,
+                    rotation_deg=args.camera_rotation_deg,
+                )
                 dataset.add_frame(
                     {
                         "observation.images.head": rgb,
