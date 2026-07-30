@@ -43,17 +43,176 @@ def _make_server(*, timeout_s: float = 0.03) -> LowLatencyTeleopPoseZMQServer:
 
 
 def _controller_snapshot(*, right: bool = False, left: bool = False) -> dict:
+    sequence = getattr(_controller_snapshot, "sequence", 0) + 1
+    _controller_snapshot.sequence = sequence
     return {
         "timestamp_ns": time.time_ns(),
         "controllers": {
-            "left": {"primary_button": left},
-            "right": {"primary_button": right},
+            "left": {
+                "primary_button": left,
+                "source_valid": True,
+                "update_sequence": sequence,
+            },
+            "right": {
+                "primary_button": right,
+                "source_valid": True,
+                "update_sequence": sequence,
+            },
         },
         "body": {"available": False},
     }
 
 
+def _make_controller_callback_server() -> LowLatencyTeleopPoseZMQServer:
+    server = _make_server()
+    server.last_controller_buttons = server._default_controller_buttons()
+    server.latest_vr_poses = None
+    server.latest_vr_recv_ns = 0
+    server.latest_vr_seq = 0
+    server.latest_vr_motion_timestamp_ns = None
+    server.latest_controller_source_timestamp_ns = None
+    server.latest_controller_recv_monotonic_ns = 0
+    server.latest_controller_recv_wall_time_ns = 0
+    server.latest_left_controller_update_sequence = None
+    server.latest_right_controller_update_sequence = None
+    server.latest_left_controller_recv_monotonic_ns = 0
+    server.latest_right_controller_recv_monotonic_ns = 0
+    server.latest_left_controller_source_valid = False
+    server.latest_right_controller_source_valid = False
+    server.callback_count = 0
+    server.vr_frame_event = threading.Event()
+    server.tap_accepting = False
+    return server
+
+
 class StartFreshFrameGateTest(unittest.TestCase):
+    def test_controller_extract_preserves_analog_hand_inputs(self) -> None:
+        server = object.__new__(LowLatencyTeleopPoseZMQServer)
+        server.last_controller_buttons = server._default_controller_buttons()
+        snapshot = {
+            "controllers": {
+                "left": {
+                    "secondary_button": True,
+                    "trigger": 0.25,
+                    "grip": 0.75,
+                    "source_valid": True,
+                    "update_sequence": 11,
+                },
+                "right": {
+                    "secondary_button": False,
+                    "trigger": 1.0005,
+                    "grip": -0.0005,
+                    "source_valid": True,
+                    "update_sequence": 12,
+                },
+            }
+        }
+
+        buttons = server._extract_controller_buttons_from_snapshot(snapshot)
+
+        self.assertTrue(buttons["left_key_two"])
+        self.assertAlmostEqual(buttons["left_index_trig_value"], 0.25)
+        self.assertAlmostEqual(buttons["left_grip_value"], 0.75)
+        self.assertAlmostEqual(buttons["right_index_trig_value"], 1.0)
+        self.assertAlmostEqual(buttons["right_grip_value"], 0.0)
+        self.assertTrue(buttons["left_index_trig"])
+        self.assertFalse(buttons["right_grip"])
+        self.assertEqual(
+            server._extract_controller_freshness(snapshot),
+            (True, 11, True, 12),
+        )
+
+        snapshot["controllers"]["right"]["grip"] = -0.5
+        self.assertEqual(
+            server._extract_controller_freshness(snapshot),
+            (True, 11, False, None),
+        )
+
+    def test_controller_freshness_fails_closed_without_binding_metadata(self) -> None:
+        snapshot = {"controllers": {"left": {"grip": 1.0}, "right": {"grip": 1.0}}}
+        self.assertEqual(
+            LowLatencyTeleopPoseZMQServer._extract_controller_freshness(snapshot),
+            (False, None, False, None),
+        )
+
+    def test_callback_does_not_refresh_or_overwrite_frozen_controller_side(self) -> None:
+        server = _make_controller_callback_server()
+
+        def snapshot(left_sequence: int, left_grip: float) -> dict:
+            return {
+                "timestamp_ns": time.time_ns(),
+                "controllers": {
+                    "left": {
+                        "grip": left_grip,
+                        "source_valid": True,
+                        "update_sequence": left_sequence,
+                    },
+                    "right": {
+                        "source_valid": True,
+                        "update_sequence": 1,
+                    },
+                },
+                "body": {"available": False},
+            }
+
+        server._on_vr_frame(snapshot(1, 0.2))
+        first_recv_ns = server.latest_left_controller_recv_monotonic_ns
+        self.assertAlmostEqual(server.last_controller_buttons["left_grip_value"], 0.2)
+
+        server._on_vr_frame(snapshot(1, 0.9))
+        self.assertEqual(server.latest_left_controller_recv_monotonic_ns, first_recv_ns)
+        self.assertAlmostEqual(server.last_controller_buttons["left_grip_value"], 0.2)
+
+        server._on_vr_frame(snapshot(2, 0.9))
+        self.assertGreaterEqual(server.latest_left_controller_recv_monotonic_ns, first_recv_ns)
+        self.assertAlmostEqual(server.last_controller_buttons["left_grip_value"], 0.9)
+
+    def test_hand_payload_rejects_frozen_controller_source(self) -> None:
+        now_ns = time.monotonic_ns()
+        buttons = LowLatencyTeleopPoseZMQServer._default_controller_buttons()
+        buttons["left_grip_value"] = 0.6
+        buttons["right_index_trig_value"] = 0.4
+        buttons["right_key_two"] = True
+
+        fresh = LowLatencyTeleopPoseZMQServer._build_hand_control_payload(
+            buttons=buttons,
+            tracking_active=True,
+            sample_monotonic_ns=now_ns,
+            sample_wall_time_ns=time.time_ns(),
+            controller_source_timestamp_ns=123,
+            left_controller_source_valid=True,
+            right_controller_source_valid=True,
+            left_controller_update_sequence=10,
+            right_controller_update_sequence=20,
+            left_controller_last_update_ns=now_ns - int(50e6),
+            right_controller_last_update_ns=now_ns - int(75e6),
+            source_timeout_ns=int(200e6),
+        )
+        stale = LowLatencyTeleopPoseZMQServer._build_hand_control_payload(
+            buttons=buttons,
+            tracking_active=True,
+            sample_monotonic_ns=now_ns,
+            sample_wall_time_ns=time.time_ns(),
+            controller_source_timestamp_ns=123,
+            left_controller_source_valid=True,
+            right_controller_source_valid=True,
+            left_controller_update_sequence=10,
+            right_controller_update_sequence=20,
+            left_controller_last_update_ns=now_ns - int(50e6),
+            right_controller_last_update_ns=now_ns - int(250e6),
+            source_timeout_ns=int(200e6),
+        )
+
+        self.assertTrue(fresh["source_valid"])
+        self.assertFalse(stale["source_valid"])
+        self.assertAlmostEqual(fresh["left"]["grip"], 0.6)
+        self.assertAlmostEqual(fresh["right"]["trigger"], 0.4)
+        self.assertTrue(fresh["right"]["secondary_button"])
+        self.assertTrue(fresh["left"]["source_valid"])
+        self.assertTrue(fresh["right"]["source_valid"])
+        self.assertFalse(stale["right"]["source_valid"])
+        self.assertEqual(fresh["left"]["update_sequence"], 10)
+
     def test_request_loop_replies_with_newest_validated_start_frame(self) -> None:
         server = _make_server(timeout_s=0.02)
         now_ns = time.monotonic_ns()
@@ -100,18 +259,7 @@ class StartFreshFrameGateTest(unittest.TestCase):
         self.assertLessEqual(payloads[0]["retarget_age_ms"], 80)
 
     def test_controller_edges_advance_epoch_and_stop_wins(self) -> None:
-        server = _make_server()
-        server.last_controller_buttons = {}
-        server.latest_vr_poses = None
-        server.latest_vr_recv_ns = 0
-        server.latest_vr_seq = 0
-        server.latest_vr_motion_timestamp_ns = None
-        server.latest_controller_source_timestamp_ns = None
-        server.latest_controller_recv_monotonic_ns = 0
-        server.latest_controller_recv_wall_time_ns = 0
-        server.callback_count = 0
-        server.vr_frame_event = threading.Event()
-        server.tap_accepting = False
+        server = _make_controller_callback_server()
 
         server._on_vr_frame(_controller_snapshot(right=True))
         self.assertEqual(server.controller_control_epoch, 2)

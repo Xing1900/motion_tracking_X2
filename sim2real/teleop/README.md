@@ -242,6 +242,7 @@ This starts a server that matches the `sim2real` tracking configuration:
 - request socket: `tcp://*:28701`
 - reply socket: `tcp://*:28702`
 - controller socket: `tcp://*:28703`
+- hand-controller broadcast: `tcp://*:28705`
 - chunk size: `5`
 - control publish rate: `50 Hz`
 
@@ -262,10 +263,13 @@ The high-level flow is:
 More concretely:
 
 - `sim2real` is the active side for motion fetching. It does not wait for a continuous push stream; it requests more reference frames when needed.
-- The bridge exposes three ZMQ channels:
+- The bridge exposes the three whole-body ZMQ channels plus an independent
+  hand-controller broadcast:
   - request channel: receives frame requests from `sim2real`
   - reply channel: sends retargeted pose chunks back
   - control channel: publishes XR controller button state
+  - hand-control channel: PUB-broadcasts fresh continuous grip/trigger values,
+    Y/B state, and the latched whole-body tracking-active flag
 - The reply payload contains `root_pos`, `root_quat`, and `dof_pos` for each returned frame.
 - On a teleop start event, the bridge first waits for three fresh GMR results generated after that controller edge. It never acknowledges a start with the stale-buffer/default fallback. `sim2real` then uses the newest validated result to align the live XR reference stream to its current anchor pose and blends into the live stream.
 - During steady-state teleop, `sim2real` keeps the buffer above its waterline by repeatedly requesting new chunks before the future horizon runs out.
@@ -275,6 +279,20 @@ The launcher defaults are `START_FRESH_FRAMES=3`,
 `START_MAX_RETARGET_AGE_MS=80`, and `START_FRESH_WAIT_TIMEOUT_MS=250`.
 If body tracking is frozen, the bridge logs `start fresh-frame gate waiting` and
 the controller stays idle; a successful start logs `start fresh-frame gate ready`.
+
+The hand-control channel is deliberately separate from port `28703`. Port
+`28703` is PUSH/PULL, so attaching a second PULL consumer would steal A/X
+events from the whole-body controller. Freshness is tracked independently for
+the left and right controller using `source_valid` and `update_sequence`
+metadata from the XRoboToolkit Pybind module. Body/head callbacks therefore do
+not refresh a frozen grip value. Either side older than
+`HAND_CTRL_SOURCE_TIMEOUT_MS` (200 ms by default) invalidates the complete hand
+payload, even though the 50 Hz bridge loop is still alive.
+
+This fails closed with an older Pybind module: port 28705 still publishes, but
+`source_valid` remains false and the robot-side hand node cannot arm. Rebuild
+and deploy the matching `XRoboToolkit-PC-Service-Pybind` module when enabling
+hand control.
 
 ## X2 demonstration recording
 

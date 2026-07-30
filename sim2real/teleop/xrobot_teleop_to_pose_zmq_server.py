@@ -332,6 +332,8 @@ class LowLatencyTeleopPoseZMQServer:
         self.start_fresh_frames = int(args.start_fresh_frames)
         self.start_max_retarget_age_ns = int(float(args.start_max_retarget_age_ms) * 1e6)
         self.start_fresh_wait_timeout_s = float(args.start_fresh_wait_timeout_ms) / 1000.0
+        self.hand_ctrl_bind_addr = str(args.hand_ctrl_bind_addr).strip()
+        self.hand_ctrl_source_timeout_ns = int(float(args.hand_ctrl_source_timeout_ms) * 1e6)
 
         if self.vis_fps <= 0:
             raise ValueError("vis_fps must be > 0")
@@ -349,6 +351,8 @@ class LowLatencyTeleopPoseZMQServer:
             raise ValueError("start_max_retarget_age_ms must be > 0")
         if self.start_fresh_wait_timeout_s <= 0:
             raise ValueError("start_fresh_wait_timeout_ms must be > 0")
+        if self.hand_ctrl_source_timeout_ns <= 0:
+            raise ValueError("hand_ctrl_source_timeout_ms must be > 0")
 
         self.retarget = None
         self.viewer = None
@@ -397,6 +401,12 @@ class LowLatencyTeleopPoseZMQServer:
         self.latest_controller_source_timestamp_ns: Optional[int] = None
         self.latest_controller_recv_monotonic_ns: int = 0
         self.latest_controller_recv_wall_time_ns: int = 0
+        self.latest_left_controller_update_sequence: Optional[int] = None
+        self.latest_right_controller_update_sequence: Optional[int] = None
+        self.latest_left_controller_recv_monotonic_ns: int = 0
+        self.latest_right_controller_recv_monotonic_ns: int = 0
+        self.latest_left_controller_source_valid: bool = False
+        self.latest_right_controller_source_valid: bool = False
         self.controller_control_epoch: int = 0
         self.controller_start_active: bool = False
         self.controller_start_edge_recv_ns: int = 0
@@ -472,13 +482,17 @@ class LowLatencyTeleopPoseZMQServer:
             "left_key_two": False,
             "left_axis_click": False,
             "left_index_trig": False,
+            "left_index_trig_value": 0.0,
             "left_grip": False,
+            "left_grip_value": 0.0,
             "left_axis": [0.0, 0.0],
             "right_key_one": False,
             "right_key_two": False,
             "right_axis_click": False,
             "right_index_trig": False,
+            "right_index_trig_value": 0.0,
             "right_grip": False,
+            "right_grip_value": 0.0,
             "right_axis": [0.0, 0.0],
         }
 
@@ -534,19 +548,148 @@ class LowLatencyTeleopPoseZMQServer:
                 return [float(values[0]), float(values[1])]
             return [0.0, 0.0]
 
+        def _unit(value: Any) -> float:
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError):
+                return 0.0
+            if not np.isfinite(numeric):
+                return 0.0
+            return float(np.clip(numeric, 0.0, 1.0))
+
+        left_trigger = _unit(left.get("trigger", 0.0))
+        left_grip = _unit(left.get("grip", 0.0))
+        right_trigger = _unit(right.get("trigger", 0.0))
+        right_grip = _unit(right.get("grip", 0.0))
+
         return {
             "left_key_one": bool(left.get("primary_button", False)),
             "left_key_two": bool(left.get("secondary_button", False)),
             "left_axis_click": bool(left.get("axis_click", False)),
-            "left_index_trig": float(left.get("trigger", 0.0)) > 1e-4,
-            "left_grip": float(left.get("grip", 0.0)) > 1e-4,
+            "left_index_trig": left_trigger > 1e-4,
+            "left_index_trig_value": left_trigger,
+            "left_grip": left_grip > 1e-4,
+            "left_grip_value": left_grip,
             "left_axis": _axis(left.get("axis", [0.0, 0.0])),
             "right_key_one": bool(right.get("primary_button", False)),
             "right_key_two": bool(right.get("secondary_button", False)),
             "right_axis_click": bool(right.get("axis_click", False)),
-            "right_index_trig": float(right.get("trigger", 0.0)) > 1e-4,
-            "right_grip": float(right.get("grip", 0.0)) > 1e-4,
+            "right_index_trig": right_trigger > 1e-4,
+            "right_index_trig_value": right_trigger,
+            "right_grip": right_grip > 1e-4,
+            "right_grip_value": right_grip,
             "right_axis": _axis(right.get("axis", [0.0, 0.0])),
+        }
+
+    @staticmethod
+    def _extract_controller_freshness(
+        snapshot: Optional[dict],
+    ) -> tuple[bool, Optional[int], bool, Optional[int]]:
+        """Read per-side freshness metadata supplied by the SDK binding.
+
+        Missing metadata deliberately fails closed.  A whole XR snapshot may
+        keep arriving from the headset/body while one controller has dropped;
+        treating the snapshot timestamp as controller freshness would then
+        replay a frozen grip value indefinitely.
+        """
+
+        controllers = snapshot.get("controllers", {}) if isinstance(snapshot, dict) else {}
+        left = controllers.get("left", {}) if isinstance(controllers, dict) else {}
+        right = controllers.get("right", {}) if isinstance(controllers, dict) else {}
+
+        def _side(controller: Any) -> tuple[bool, Optional[int]]:
+            if not isinstance(controller, dict) or not bool(controller.get("source_valid", False)):
+                return False, None
+            for key in ("trigger", "grip"):
+                try:
+                    value = float(controller.get(key, 0.0))
+                except (TypeError, ValueError):
+                    return False, None
+                # Tolerate only floating-point noise around the SDK's [0, 1]
+                # contract. A bad analog value must disarm, never become an
+                # implicit release/open command.
+                if not np.isfinite(value) or value < -1e-3 or value > 1.001:
+                    return False, None
+            try:
+                sequence = int(controller.get("update_sequence", 0))
+            except (TypeError, ValueError):
+                return False, None
+            if sequence <= 0:
+                return False, None
+            return True, sequence
+
+        left_valid, left_sequence = _side(left)
+        right_valid, right_sequence = _side(right)
+        return left_valid, left_sequence, right_valid, right_sequence
+
+    @staticmethod
+    def _build_hand_control_payload(
+        *,
+        buttons: Dict[str, Any],
+        tracking_active: bool,
+        sample_monotonic_ns: int,
+        sample_wall_time_ns: int,
+        controller_source_timestamp_ns: Optional[int],
+        left_controller_source_valid: bool,
+        right_controller_source_valid: bool,
+        left_controller_update_sequence: Optional[int],
+        right_controller_update_sequence: Optional[int],
+        left_controller_last_update_ns: int,
+        right_controller_last_update_ns: int,
+        source_timeout_ns: int,
+    ) -> Dict[str, Any]:
+        def _freshness(source_valid: bool, last_update_ns: int) -> tuple[bool, Optional[float]]:
+            if not source_valid or last_update_ns <= 0:
+                return False, None
+            age_ns = max(0, int(sample_monotonic_ns) - int(last_update_ns))
+            return age_ns <= int(source_timeout_ns), age_ns / 1e6
+
+        left_valid, left_age_ms = _freshness(
+            left_controller_source_valid, left_controller_last_update_ns
+        )
+        right_valid, right_age_ms = _freshness(
+            right_controller_source_valid, right_controller_last_update_ns
+        )
+        source_valid = left_valid and right_valid
+        controller_age_ms = (
+            max(left_age_ms, right_age_ms)
+            if left_age_ms is not None and right_age_ms is not None
+            else None
+        )
+
+        def _float(name: str) -> float:
+            try:
+                value = float(buttons.get(name, 0.0))
+            except (TypeError, ValueError):
+                return 0.0
+            if not np.isfinite(value):
+                return 0.0
+            return float(np.clip(value, 0.0, 1.0))
+
+        return {
+            "schema_version": 1,
+            "bridge_sample_monotonic_ns": int(sample_monotonic_ns),
+            "bridge_sample_wall_time_ns": int(sample_wall_time_ns),
+            "controller_source_timestamp_ns": controller_source_timestamp_ns,
+            "controller_age_ms": controller_age_ms,
+            "source_valid": bool(source_valid),
+            "tracking_active": bool(tracking_active),
+            "left": {
+                "grip": _float("left_grip_value"),
+                "trigger": _float("left_index_trig_value"),
+                "secondary_button": bool(buttons.get("left_key_two", False)),
+                "source_valid": bool(left_valid),
+                "age_ms": left_age_ms,
+                "update_sequence": left_controller_update_sequence,
+            },
+            "right": {
+                "grip": _float("right_grip_value"),
+                "trigger": _float("right_index_trig_value"),
+                "secondary_button": bool(buttons.get("right_key_two", False)),
+                "source_valid": bool(right_valid),
+                "age_ms": right_age_ms,
+                "update_sequence": right_controller_update_sequence,
+            },
         }
 
     @staticmethod
@@ -613,7 +756,13 @@ class LowLatencyTeleopPoseZMQServer:
     def _on_vr_frame(self, snapshot: dict) -> None:
         recv_ns = time.monotonic_ns()
         recv_wall_time_ns = time.time_ns()
-        controller_buttons = self._extract_controller_buttons_from_snapshot(snapshot)
+        incoming_controller_buttons = self._extract_controller_buttons_from_snapshot(snapshot)
+        (
+            left_controller_valid,
+            left_controller_sequence,
+            right_controller_valid,
+            right_controller_sequence,
+        ) = self._extract_controller_freshness(snapshot)
         top_timestamp_ns = None
         try:
             top_timestamp_ns = int(snapshot.get("timestamp_ns", 0)) if isinstance(snapshot, dict) else None
@@ -633,6 +782,29 @@ class LowLatencyTeleopPoseZMQServer:
         should_wake_start_gate = False
         vr_seq = 0
         with self.latest_vr_lock:
+            controller_buttons = dict(self.last_controller_buttons)
+            default_buttons = self._default_controller_buttons()
+            left_is_new = (
+                left_controller_valid
+                and left_controller_sequence != self.latest_left_controller_update_sequence
+            )
+            right_is_new = (
+                right_controller_valid
+                and right_controller_sequence != self.latest_right_controller_update_sequence
+            )
+            for side, side_valid, side_is_new in (
+                ("left", left_controller_valid, left_is_new),
+                ("right", right_controller_valid, right_is_new),
+            ):
+                if side_is_new:
+                    for key, value in incoming_controller_buttons.items():
+                        if key.startswith(f"{side}_"):
+                            controller_buttons[key] = value
+                elif not side_valid:
+                    for key, value in default_buttons.items():
+                        if key.startswith(f"{side}_"):
+                            controller_buttons[key] = value
+
             prev_right_key_one = bool(self.last_controller_buttons.get("right_key_one", False))
             prev_left_key_one = bool(self.last_controller_buttons.get("left_key_one", False))
             right_key_one = bool(controller_buttons.get("right_key_one", False))
@@ -653,6 +825,14 @@ class LowLatencyTeleopPoseZMQServer:
             self.latest_controller_source_timestamp_ns = top_timestamp_ns
             self.latest_controller_recv_monotonic_ns = recv_ns
             self.latest_controller_recv_wall_time_ns = recv_wall_time_ns
+            self.latest_left_controller_source_valid = left_controller_valid
+            self.latest_right_controller_source_valid = right_controller_valid
+            if left_is_new:
+                self.latest_left_controller_update_sequence = left_controller_sequence
+                self.latest_left_controller_recv_monotonic_ns = recv_ns
+            if right_is_new:
+                self.latest_right_controller_update_sequence = right_controller_sequence
+                self.latest_right_controller_recv_monotonic_ns = recv_ns
             self.callback_count += 1
             if body_available and motion_timestamp_ns is not None:
                 if self.latest_vr_motion_timestamp_ns != motion_timestamp_ns:
@@ -1396,47 +1576,98 @@ class LowLatencyTeleopPoseZMQServer:
         import zmq
 
         period_s = 1.0 / float(self.ctrl_fps)
-        while not self.stop_event.is_set():
-            with self.latest_vr_lock:
-                buttons = dict(self.last_controller_buttons)
-                controller_source_timestamp_ns = self.latest_controller_source_timestamp_ns
-                controller_last_update_ns = self.latest_controller_recv_monotonic_ns
-                controller_last_update_wall_time_ns = self.latest_controller_recv_wall_time_ns
-
-            payload = {
-                "t_ms": int(time.time() * 1000),
-                "controller_buttons": buttons,
-            }
+        hand_ctrl_sock = None
+        if self.hand_ctrl_bind_addr:
             try:
-                self.ctrl_sock.send_string(json.dumps(payload), flags=zmq.NOBLOCK)
-            except zmq.Again:
-                pass
+                hand_ctrl_sock = self.zmq_context.socket(zmq.PUB)
+                hand_ctrl_sock.setsockopt(zmq.LINGER, 0)
+                hand_ctrl_sock.setsockopt(zmq.SNDHWM, 1)
+                hand_ctrl_sock.setsockopt(zmq.CONFLATE, 1)
+                hand_ctrl_sock.bind(self.hand_ctrl_bind_addr)
+                print(f"[hand_ctrl] publishing fresh controller state at {self.hand_ctrl_bind_addr}")
             except Exception as exc:
-                print(f"[Warning] control send failed: {exc}")
+                if hand_ctrl_sock is not None:
+                    hand_ctrl_sock.close(0)
+                    hand_ctrl_sock = None
+                print(f"[Warning] hand control publisher disabled: {exc}")
 
-            if self.tap_accepting:
-                sample_ns = time.monotonic_ns()
+        try:
+            while not self.stop_event.is_set():
+                with self.latest_vr_lock:
+                    buttons = dict(self.last_controller_buttons)
+                    controller_source_timestamp_ns = self.latest_controller_source_timestamp_ns
+                    controller_last_update_ns = self.latest_controller_recv_monotonic_ns
+                    controller_last_update_wall_time_ns = self.latest_controller_recv_wall_time_ns
+                    left_controller_source_valid = self.latest_left_controller_source_valid
+                    right_controller_source_valid = self.latest_right_controller_source_valid
+                    left_controller_update_sequence = self.latest_left_controller_update_sequence
+                    right_controller_update_sequence = self.latest_right_controller_update_sequence
+                    left_controller_last_update_ns = self.latest_left_controller_recv_monotonic_ns
+                    right_controller_last_update_ns = self.latest_right_controller_recv_monotonic_ns
+                    tracking_active = bool(self.controller_start_active)
+
+                payload = {
+                    "t_ms": int(time.time() * 1000),
+                    "controller_buttons": buttons,
+                }
                 try:
-                    self._enqueue_tap(
-                        "controller",
-                        {
-                            "bridge_sample_monotonic_ns": sample_ns,
-                            "bridge_sample_wall_time_ns": time.time_ns(),
-                            "controller_source_timestamp_ns": controller_source_timestamp_ns,
-                            "controller_last_update_monotonic_ns": controller_last_update_ns or None,
-                            "controller_last_update_wall_time_ns": controller_last_update_wall_time_ns or None,
-                            "controller_age_ms": (
-                                None
-                                if controller_last_update_ns <= 0
-                                else (sample_ns - controller_last_update_ns) / 1e6
-                            ),
-                            "controller_buttons": buttons,
-                        },
-                    )
-                except Exception:
-                    self._count_tap_prepare_drop()
+                    self.ctrl_sock.send_string(json.dumps(payload), flags=zmq.NOBLOCK)
+                except zmq.Again:
+                    pass
+                except Exception as exc:
+                    print(f"[Warning] control send failed: {exc}")
 
-            self.stop_event.wait(timeout=period_s)
+                sample_ns = time.monotonic_ns()
+                sample_wall_time_ns = time.time_ns()
+                if hand_ctrl_sock is not None:
+                    hand_payload = self._build_hand_control_payload(
+                        buttons=buttons,
+                        tracking_active=tracking_active,
+                        sample_monotonic_ns=sample_ns,
+                        sample_wall_time_ns=sample_wall_time_ns,
+                        controller_source_timestamp_ns=controller_source_timestamp_ns,
+                        left_controller_source_valid=left_controller_source_valid,
+                        right_controller_source_valid=right_controller_source_valid,
+                        left_controller_update_sequence=left_controller_update_sequence,
+                        right_controller_update_sequence=right_controller_update_sequence,
+                        left_controller_last_update_ns=left_controller_last_update_ns,
+                        right_controller_last_update_ns=right_controller_last_update_ns,
+                        source_timeout_ns=self.hand_ctrl_source_timeout_ns,
+                    )
+                    try:
+                        hand_ctrl_sock.send_string(
+                            json.dumps(hand_payload, separators=(",", ":")), flags=zmq.NOBLOCK
+                        )
+                    except zmq.Again:
+                        pass
+                    except Exception as exc:
+                        print(f"[Warning] hand control send failed: {exc}")
+
+                if self.tap_accepting:
+                    try:
+                        self._enqueue_tap(
+                            "controller",
+                            {
+                                "bridge_sample_monotonic_ns": sample_ns,
+                                "bridge_sample_wall_time_ns": sample_wall_time_ns,
+                                "controller_source_timestamp_ns": controller_source_timestamp_ns,
+                                "controller_last_update_monotonic_ns": controller_last_update_ns or None,
+                                "controller_last_update_wall_time_ns": controller_last_update_wall_time_ns or None,
+                                "controller_age_ms": (
+                                    None
+                                    if controller_last_update_ns <= 0
+                                    else (sample_ns - controller_last_update_ns) / 1e6
+                                ),
+                                "controller_buttons": buttons,
+                            },
+                        )
+                    except Exception:
+                        self._count_tap_prepare_drop()
+
+                self.stop_event.wait(timeout=period_s)
+        finally:
+            if hand_ctrl_sock is not None:
+                hand_ctrl_sock.close(0)
 
     def _tap_publisher_loop(self) -> None:
         if not self.tap_bind_addr:
@@ -1582,6 +1813,8 @@ class LowLatencyTeleopPoseZMQServer:
         print(f"  req_bind_addr: {self.args.req_bind_addr}")
         print(f"  rep_bind_addr: {self.args.rep_bind_addr}")
         print(f"  ctrl_bind_addr: {self.args.ctrl_bind_addr}")
+        print(f"  hand_ctrl_bind_addr: {self.hand_ctrl_bind_addr or '<disabled>'}")
+        print(f"  hand_ctrl_source_timeout_ms: {self.hand_ctrl_source_timeout_ns / 1e6:.3f}")
         print(f"  tap_bind_addr: {self.tap_bind_addr or '<disabled>'}")
         print(f"  ctrl_fps: {self.ctrl_fps}")
         print(f"  gmr_max_iter: {self.gmr_max_iter}")
@@ -1752,6 +1985,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--req_bind_addr", type=str, default="tcp://*:28701")
     parser.add_argument("--rep_bind_addr", type=str, default="tcp://*:28702")
     parser.add_argument("--ctrl_bind_addr", type=str, default="tcp://*:28703")
+    parser.add_argument(
+        "--hand_ctrl_bind_addr",
+        type=str,
+        default="tcp://*:28705",
+        help=(
+            "Independent PUB endpoint for fresh analog hand-controller state. "
+            "Use a dedicated endpoint because rep/ctrl are PUSH/PULL and cannot be shared."
+        ),
+    )
+    parser.add_argument(
+        "--hand_ctrl_source_timeout_ms",
+        type=float,
+        default=200.0,
+        help="Mark hand controller samples invalid when the XR callback is older than this",
+    )
     parser.add_argument(
         "--tap_bind_addr",
         type=str,
