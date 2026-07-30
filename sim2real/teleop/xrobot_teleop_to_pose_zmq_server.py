@@ -58,13 +58,17 @@ XR_BODY_JOINT_NAMES = [
 ]
 
 
-def _load_runtime_dependencies() -> None:
+def _load_runtime_dependencies(*, visualize: bool = False) -> None:
     global GMR, RobotMotionViewer, quat_mul_np, xrt
 
     try:
         from general_motion_retargeting import GeneralMotionRetargeting as _GMR
-        from general_motion_retargeting import RobotMotionViewer as _RobotMotionViewer
         from general_motion_retargeting.rot_utils import quat_mul_np as _quat_mul_np
+
+        if visualize:
+            from general_motion_retargeting import RobotMotionViewer as _RobotMotionViewer
+        else:
+            _RobotMotionViewer = None
     except ImportError as exc:
         raise ImportError(
             "Failed to import 'general_motion_retargeting'. Install GMR in the active Python environment."
@@ -325,6 +329,9 @@ class LowLatencyTeleopPoseZMQServer:
         self.lookback_ns = int(float(args.lookback_ms) * 1e6)
         self.retarget_buffer_window_ns = int(float(args.retarget_buffer_window_s) * 1e9)
         self.log_interval_s = float(args.log_interval_s)
+        self.start_fresh_frames = int(args.start_fresh_frames)
+        self.start_max_retarget_age_ns = int(float(args.start_max_retarget_age_ms) * 1e6)
+        self.start_fresh_wait_timeout_s = float(args.start_fresh_wait_timeout_ms) / 1000.0
 
         if self.vis_fps <= 0:
             raise ValueError("vis_fps must be > 0")
@@ -336,6 +343,12 @@ class LowLatencyTeleopPoseZMQServer:
             raise ValueError("retarget_buffer_window_s must be > 0")
         if self.log_interval_s < 0:
             raise ValueError("log_interval_s must be >= 0")
+        if self.start_fresh_frames <= 0:
+            raise ValueError("start_fresh_frames must be > 0")
+        if self.start_max_retarget_age_ns <= 0:
+            raise ValueError("start_max_retarget_age_ms must be > 0")
+        if self.start_fresh_wait_timeout_s <= 0:
+            raise ValueError("start_fresh_wait_timeout_ms must be > 0")
 
         self.retarget = None
         self.viewer = None
@@ -384,8 +397,12 @@ class LowLatencyTeleopPoseZMQServer:
         self.latest_controller_source_timestamp_ns: Optional[int] = None
         self.latest_controller_recv_monotonic_ns: int = 0
         self.latest_controller_recv_wall_time_ns: int = 0
+        self.controller_control_epoch: int = 0
+        self.controller_start_active: bool = False
+        self.controller_start_edge_recv_ns: int = 0
 
         self.retarget_buffer_lock = threading.Lock()
+        self.retarget_buffer_condition = threading.Condition(self.retarget_buffer_lock)
         self.retarget_buffer: deque[RetargetedFrame] = deque()
         self.vis_lock = threading.Lock()
         self.latest_vis_qpos: Optional[np.ndarray] = None
@@ -403,6 +420,8 @@ class LowLatencyTeleopPoseZMQServer:
         self.reply_drop_count = 0
         self.req_merged_total = 0
         self.fallback_count = 0
+        self.start_gate_wait_count = 0
+        self.start_gate_ready_count = 0
         self.raw_motion_drop_count = 0
         self.latest_req_dt_ms: Optional[float] = None
         self.latest_merged_reqs = 0
@@ -611,8 +630,25 @@ class LowLatencyTeleopPoseZMQServer:
         motion_timestamp_ns = body_timestamp_ns if body_timestamp_ns not in (None, 0) else top_timestamp_ns
 
         should_wake_retarget = False
+        should_wake_start_gate = False
         vr_seq = 0
         with self.latest_vr_lock:
+            prev_right_key_one = bool(self.last_controller_buttons.get("right_key_one", False))
+            prev_left_key_one = bool(self.last_controller_buttons.get("left_key_one", False))
+            right_key_one = bool(controller_buttons.get("right_key_one", False))
+            left_key_one = bool(controller_buttons.get("left_key_one", False))
+            start_rise = right_key_one and not prev_right_key_one
+            stop_rise = left_key_one and not prev_left_key_one
+            # Match the C++ source: stop wins if both buttons rise together.
+            if stop_rise:
+                self.controller_control_epoch += 1
+                self.controller_start_active = False
+                should_wake_start_gate = True
+            elif start_rise:
+                self.controller_control_epoch += 1
+                self.controller_start_active = True
+                self.controller_start_edge_recv_ns = recv_ns
+                should_wake_start_gate = True
             self.last_controller_buttons = controller_buttons
             self.latest_controller_source_timestamp_ns = top_timestamp_ns
             self.latest_controller_recv_monotonic_ns = recv_ns
@@ -626,6 +662,9 @@ class LowLatencyTeleopPoseZMQServer:
                     self.latest_vr_motion_timestamp_ns = motion_timestamp_ns
                     should_wake_retarget = True
             vr_seq = self.latest_vr_seq
+        if should_wake_start_gate:
+            with self.retarget_buffer_condition:
+                self.retarget_buffer_condition.notify_all()
         if should_wake_retarget:
             # Wake the control path before doing any recorder-only copying.
             self.vr_frame_event.set()
@@ -653,10 +692,11 @@ class LowLatencyTeleopPoseZMQServer:
 
     def _append_retarget_frame(self, recv_ns: int, qpos: np.ndarray) -> None:
         cutoff_ns = recv_ns - self.retarget_buffer_window_ns
-        with self.retarget_buffer_lock:
+        with self.retarget_buffer_condition:
             self.retarget_buffer.append(RetargetedFrame(recv_ns=recv_ns, qpos=qpos.astype(np.float32, copy=True)))
             while self.retarget_buffer and self.retarget_buffer[0].recv_ns < cutoff_ns:
                 self.retarget_buffer.popleft()
+            self.retarget_buffer_condition.notify_all()
 
     @staticmethod
     def _copy_human_motion_data(human_motion_data: Any) -> Optional[Dict[str, Any]]:
@@ -675,6 +715,112 @@ class LowLatencyTeleopPoseZMQServer:
     def _get_retarget_frames_snapshot(self) -> list[RetargetedFrame]:
         with self.retarget_buffer_lock:
             return list(self.retarget_buffer)
+
+    def _get_controller_start_epoch(self) -> tuple[int, bool, int]:
+        with self.latest_vr_lock:
+            return (
+                self.controller_control_epoch,
+                self.controller_start_active,
+                self.controller_start_edge_recv_ns,
+            )
+
+    def _is_start_gate_current(
+        self,
+        expected_epoch: int,
+        selected_recv_ns: Optional[int] = None,
+        now_ns: Optional[int] = None,
+    ) -> bool:
+        with self.latest_vr_lock:
+            epoch_matches = self.controller_control_epoch == expected_epoch
+            start_active = self.controller_start_active
+        if not epoch_matches or not start_active:
+            return False
+        if selected_recv_ns is None:
+            return True
+        check_ns = time.monotonic_ns() if now_ns is None else int(now_ns)
+        return max(0, check_ns - int(selected_recv_ns)) <= self.start_max_retarget_age_ns
+
+    def _wait_for_fresh_start_qpos(
+        self,
+        cutoff_ns: int,
+        expected_epoch: Optional[int] = None,
+    ) -> tuple[Optional[np.ndarray], Dict[str, Any]]:
+        """Wait for a small post-start retarget window and return its newest frame.
+
+        A start acknowledgement must never be built from the normal
+        fallback_latest/default path.  In particular, the retarget deque only
+        expires old entries when a new result is appended, so its tail may be
+        arbitrarily old while XR body tracking is frozen even though controller
+        button callbacks continue to arrive.
+        """
+
+        deadline_ns = time.monotonic_ns() + int(self.start_fresh_wait_timeout_s * 1e9)
+        last_info: Dict[str, Any] = {
+            "mode": "start_wait_fresh",
+            "target_ns": int(cutoff_ns),
+            "older_ns": None,
+            "newer_ns": None,
+            "alpha": None,
+            "buffer_len": 0,
+            "fresh_frame_count": 0,
+            "latest_age_ms": None,
+        }
+
+        with self.retarget_buffer_condition:
+            while not self.stop_event.is_set():
+                now_ns = time.monotonic_ns()
+                if expected_epoch is not None and not self._is_start_gate_current(
+                    expected_epoch=expected_epoch,
+                    now_ns=now_ns,
+                ):
+                    last_info["mode"] = "start_cancelled"
+                    return None, last_info
+
+                # All frames in the validation window must belong to this
+                # start epoch and still be recent, not only the selected tail.
+                fresh_cutoff_ns = max(cutoff_ns, now_ns - self.start_max_retarget_age_ns)
+                fresh = [
+                    frame for frame in self.retarget_buffer if frame.recv_ns >= fresh_cutoff_ns
+                ]
+                newest = self.retarget_buffer[-1] if self.retarget_buffer else None
+                newest_age_ns = None if newest is None else max(0, now_ns - newest.recv_ns)
+                last_info = {
+                    "mode": "start_wait_fresh",
+                    "target_ns": int(cutoff_ns),
+                    "older_ns": None if not fresh else int(fresh[0].recv_ns),
+                    "newer_ns": None if newest is None else int(newest.recv_ns),
+                    "alpha": None,
+                    "buffer_len": len(self.retarget_buffer),
+                    "fresh_frame_count": len(fresh),
+                    "latest_age_ms": (
+                        None if newest_age_ns is None else round(newest_age_ns / 1e6, 3)
+                    ),
+                }
+
+                if (
+                    len(fresh) >= self.start_fresh_frames
+                    and newest_age_ns is not None
+                    and newest_age_ns <= self.start_max_retarget_age_ns
+                ):
+                    selected = fresh[-1]
+                    ready_info = dict(last_info)
+                    ready_info.update(
+                        {
+                            "mode": "start_fresh",
+                            "older_ns": int(fresh[0].recv_ns),
+                            "newer_ns": int(selected.recv_ns),
+                            "selected_recv_ns": int(selected.recv_ns),
+                            "selected_age_ms": round(max(0, now_ns - selected.recv_ns) / 1e6, 3),
+                        }
+                    )
+                    return selected.qpos.astype(np.float32, copy=True), ready_info
+
+                remaining_ns = deadline_ns - now_ns
+                if remaining_ns <= 0:
+                    break
+                self.retarget_buffer_condition.wait(timeout=min(0.05, remaining_ns / 1e9))
+
+        return None, last_info
 
     def _sample_target_qpos(self, frames: list[RetargetedFrame], target_ns: int) -> tuple[np.ndarray, bool, Dict[str, Any]]:
         if not frames:
@@ -988,6 +1134,13 @@ class LowLatencyTeleopPoseZMQServer:
     def _request_loop(self) -> None:
         import zmq
 
+        active_start_epoch: Optional[int] = None
+        start_cutoff_ns: Optional[int] = None
+        start_ack_qpos: Optional[np.ndarray] = None
+        start_ack_info: Optional[Dict[str, Any]] = None
+        start_ack_sent = False
+        last_start_wait_log_ns = 0
+
         while not self.stop_event.is_set():
             req, req_recv_ns, merged_reqs = self._drain_requests_blocking()
             if req is None or req_recv_ns is None:
@@ -1003,7 +1156,101 @@ class LowLatencyTeleopPoseZMQServer:
                 self.latest_req_dt_ms = (now - self.last_req_monotonic) * 1000.0
             self.last_req_monotonic = now
 
-            out_frames, used_fallback, sample_info = self._build_reply_frames(req_recv_ns=req_recv_ns)
+            request_start = bool(req.get("start", False))
+            if request_start:
+                controller_epoch, start_active, controller_edge_ns = (
+                    self._get_controller_start_epoch()
+                )
+                if not start_active:
+                    # This is a queued request from a session that has already
+                    # been stopped. Never turn it into a start acknowledgement.
+                    active_start_epoch = None
+                    start_cutoff_ns = None
+                    start_ack_qpos = None
+                    start_ack_info = None
+                    start_ack_sent = False
+                    continue
+                if active_start_epoch != controller_epoch or start_cutoff_ns is None:
+                    active_start_epoch = controller_epoch
+                    # Require results originating after both the button edge and
+                    # the first corresponding start request. Results already in
+                    # flight carry an older recv_ns and are filtered out.
+                    start_cutoff_ns = max(int(req_recv_ns), int(controller_edge_ns))
+                    start_ack_qpos = None
+                    start_ack_info = None
+                    start_ack_sent = False
+
+                if start_ack_info is not None:
+                    selected_recv_ns = start_ack_info.get("selected_recv_ns")
+                    if selected_recv_ns is None or not self._is_start_gate_current(
+                        expected_epoch=active_start_epoch,
+                        selected_recv_ns=int(selected_recv_ns),
+                    ):
+                        # PUSH enqueue success is not an acknowledgement from
+                        # the C++ consumer. Refresh an expired cached start pose
+                        # instead of replaying it indefinitely.
+                        start_ack_qpos = None
+                        start_ack_info = None
+                        start_ack_sent = False
+
+                if start_ack_qpos is None or start_ack_info is None:
+                    start_ack_qpos, start_ack_info = self._wait_for_fresh_start_qpos(
+                        cutoff_ns=start_cutoff_ns,
+                        expected_epoch=active_start_epoch,
+                    )
+                    if start_ack_qpos is None:
+                        self._update_debug_info(
+                            sample_info=start_ack_info,
+                            req_recv_ns=req_recv_ns,
+                        )
+                        if start_ack_info.get("mode") == "start_cancelled":
+                            start_ack_info = None
+                            start_ack_qpos = None
+                            continue
+                        self.start_gate_wait_count += 1
+                        now_ns = time.monotonic_ns()
+                        if now_ns - last_start_wait_log_ns >= int(1e9):
+                            print(
+                                "[Warning] start fresh-frame gate waiting "
+                                f"epoch={active_start_epoch}, "
+                                f"fresh={start_ack_info.get('fresh_frame_count', 0)}/"
+                                f"{self.start_fresh_frames}, "
+                                f"latest_age_ms={start_ack_info.get('latest_age_ms')}, "
+                                f"cutoff_ns={start_cutoff_ns}"
+                            )
+                            last_start_wait_log_ns = now_ns
+                        # Do not acknowledge start with fallback_latest/default.
+                        # The C++ source keeps neutral A active and retries.
+                        continue
+
+                    self.start_gate_ready_count += 1
+                    right_arm = np.asarray(start_ack_qpos, dtype=np.float32).reshape(-1)[29:36]
+                    print(
+                        "[Info] start fresh-frame gate ready "
+                        f"epoch={active_start_epoch}, "
+                        f"fresh={start_ack_info.get('fresh_frame_count')}, "
+                        f"selected_age_ms={start_ack_info.get('selected_age_ms')}, "
+                        f"right_arm={np.round(right_arm, 4).tolist()}"
+                    )
+
+                out_frames = [start_ack_qpos.astype(np.float32, copy=True)]
+                used_fallback = False
+                sample_info = dict(start_ack_info)
+                if start_ack_sent:
+                    sample_info["mode"] = "start_fresh_cached"
+            else:
+                # A regular request proves the controller accepted the start
+                # acknowledgement. Retire its cached reply so the next button
+                # epoch must pass a new freshness gate.
+                active_start_epoch = None
+                start_cutoff_ns = None
+                start_ack_qpos = None
+                start_ack_info = None
+                start_ack_sent = False
+                out_frames, used_fallback, sample_info = self._build_reply_frames(
+                    req_recv_ns=req_recv_ns
+                )
+
             self._update_debug_info(sample_info=sample_info, req_recv_ns=req_recv_ns)
             if used_fallback:
                 self.fallback_count += 1
@@ -1011,13 +1258,22 @@ class LowLatencyTeleopPoseZMQServer:
             seq_start = int(self.frame_seq)
             self.frame_seq += len(out_frames)
 
-            retarget_frames = self._get_retarget_frames_snapshot()
             retarget_age_ms = None
-            if retarget_frames:
-                retarget_age_ms = int((time.monotonic_ns() - retarget_frames[-1].recv_ns) / 1e6)
+            if request_start:
+                selected_recv_ns = sample_info.get("selected_recv_ns")
+                if selected_recv_ns is not None:
+                    retarget_age_ms = int(
+                        max(0, time.monotonic_ns() - int(selected_recv_ns)) / 1e6
+                    )
+            else:
+                retarget_frames = self._get_retarget_frames_snapshot()
+                if retarget_frames:
+                    retarget_age_ms = int(
+                        max(0, time.monotonic_ns() - retarget_frames[-1].recv_ns) / 1e6
+                    )
 
             payload = {
-                "start": bool(req.get("start", False)),
+                "start": request_start,
                 "no_interp_applied": bool(used_fallback),
                 "chunk_size": len(out_frames),
                 "frame_seq_start": seq_start,
@@ -1025,10 +1281,32 @@ class LowLatencyTeleopPoseZMQServer:
                 "t_rep_ms": int(time.time() * 1000),
                 "frames": [self._serialize_qpos_frame(x) for x in out_frames],
             }
+            payload_json = json.dumps(payload)
 
             try:
-                self.rep_sock.send_string(json.dumps(payload), flags=zmq.NOBLOCK)
+                if request_start:
+                    # Make the epoch/age check and PUSH enqueue atomic relative
+                    # to controller edge updates in the XR callback.
+                    with self.latest_vr_lock:
+                        selected_recv_ns = int(sample_info["selected_recv_ns"])
+                        now_ns = time.monotonic_ns()
+                        send_is_current = (
+                            self.controller_control_epoch == active_start_epoch
+                            and self.controller_start_active
+                            and max(0, now_ns - selected_recv_ns)
+                            <= self.start_max_retarget_age_ns
+                        )
+                        if not send_is_current:
+                            start_ack_qpos = None
+                            start_ack_info = None
+                            start_ack_sent = False
+                            continue
+                        self.rep_sock.send_string(payload_json, flags=zmq.NOBLOCK)
+                else:
+                    self.rep_sock.send_string(payload_json, flags=zmq.NOBLOCK)
                 self.reply_count += 1
+                if request_start:
+                    start_ack_sent = True
             except zmq.Again:
                 self.reply_drop_count += 1
                 print("[Warning] reply queue full, drop one reply")
@@ -1041,7 +1319,16 @@ class LowLatencyTeleopPoseZMQServer:
                             "reference",
                             {
                                 "bridge_recv_monotonic_ns": int(req_recv_ns),
-                                "request_start": bool(req.get("start", False)),
+                                "request_start": request_start,
+                                "start_control_epoch": (
+                                    active_start_epoch if request_start else None
+                                ),
+                                "start_fresh_frame_count": sample_info.get(
+                                    "fresh_frame_count"
+                                ),
+                                "start_selected_recv_ns": sample_info.get(
+                                    "selected_recv_ns"
+                                ),
                                 "frame_seq_start": seq_start,
                                 "frame_dt_ns": int(round(1e9 / float(self.ctrl_fps))),
                                 "no_interp_applied": bool(used_fallback),
@@ -1072,6 +1359,8 @@ class LowLatencyTeleopPoseZMQServer:
             reply_drop_count = int(self.reply_drop_count)
             req_merged_total = int(self.req_merged_total)
             fallback_count = int(self.fallback_count)
+            start_gate_wait_count = int(self.start_gate_wait_count)
+            start_gate_ready_count = int(self.start_gate_ready_count)
             raw_motion_drop_count = int(self.raw_motion_drop_count)
             latest_merged_reqs = int(self.latest_merged_reqs)
             latest_req_dt_ms = self.latest_req_dt_ms
@@ -1089,6 +1378,7 @@ class LowLatencyTeleopPoseZMQServer:
                 f"req={req_count}, rep={reply_count}, rep_drop={reply_drop_count}, "
                 f"req_merged_total={req_merged_total}, latest_merged={latest_merged_reqs}, "
                 f"fallback={fallback_count}, raw_drop={raw_motion_drop_count}, "
+                f"start_wait={start_gate_wait_count}, start_ready={start_gate_ready_count}, "
                 f"tap_sent={tap_sent_count}, tap_queue_drop={tap_queue_drop_count}, "
                 f"tap_send_drop={tap_send_drop_count}, tap_prepare_drop={tap_prepare_drop_count}, "
                 f"cb={callback_count}, retarget={retarget_count}, "
@@ -1298,6 +1588,9 @@ class LowLatencyTeleopPoseZMQServer:
         print("  chunk_size: fixed to 1 frame per reply")
         print(f"  lookback_ms: {self.lookback_ns / 1e6:.3f}")
         print(f"  retarget_buffer_window_s: {self.retarget_buffer_window_ns / 1e9:.3f}")
+        print(f"  start_fresh_frames: {self.start_fresh_frames}")
+        print(f"  start_max_retarget_age_ms: {self.start_max_retarget_age_ns / 1e6:.3f}")
+        print(f"  start_fresh_wait_timeout_ms: {self.start_fresh_wait_timeout_s * 1e3:.3f}")
         print(f"  log_interval_s: {self.log_interval_s:.3f}")
         print(f"  visualize: {self.args.visualize}")
         print(f"  retarget_worker_pid: {self.retarget_process.pid if self.retarget_process else None}")
@@ -1433,6 +1726,24 @@ def parse_args() -> argparse.Namespace:
         help="How much retarget history to keep for timestamp interpolation",
     )
     parser.add_argument(
+        "--start_fresh_frames",
+        type=int,
+        default=3,
+        help="Post-start retarget frames required before acknowledging a VR session",
+    )
+    parser.add_argument(
+        "--start_max_retarget_age_ms",
+        type=float,
+        default=80.0,
+        help="Maximum age of the retarget frame used to acknowledge VR start",
+    )
+    parser.add_argument(
+        "--start_fresh_wait_timeout_ms",
+        type=float,
+        default=250.0,
+        help="Wait per start request before deferring acknowledgement for a retry",
+    )
+    parser.add_argument(
         "--log_interval_s",
         type=float,
         default=1.0,
@@ -1470,7 +1781,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    _load_runtime_dependencies()
+    _load_runtime_dependencies(visualize=args.visualize)
     server = LowLatencyTeleopPoseZMQServer(args)
     server.run()
 

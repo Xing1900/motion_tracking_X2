@@ -267,9 +267,14 @@ More concretely:
   - reply channel: sends retargeted pose chunks back
   - control channel: publishes XR controller button state
 - The reply payload contains `root_pos`, `root_quat`, and `dof_pos` for each returned frame.
-- On a teleop start event, `sim2real` uses the first returned frame to align the live XR reference stream to its current anchor pose, then blends into the live stream.
+- On a teleop start event, the bridge first waits for three fresh GMR results generated after that controller edge. It never acknowledges a start with the stale-buffer/default fallback. `sim2real` then uses the newest validated result to align the live XR reference stream to its current anchor pose and blends into the live stream.
 - During steady-state teleop, `sim2real` keeps the buffer above its waterline by repeatedly requesting new chunks before the future horizon runs out.
 - The bridge may interpolate between the previously sent pose and the newest retargeted pose for non-start replies, which reduces discontinuities in the returned chunk.
+
+The launcher defaults are `START_FRESH_FRAMES=3`,
+`START_MAX_RETARGET_AGE_MS=80`, and `START_FRESH_WAIT_TIMEOUT_MS=250`.
+If body tracking is frozen, the bridge logs `start fresh-frame gate waiting` and
+the controller stays idle; a successful start logs `start fresh-frame gate ready`.
 
 ## X2 demonstration recording
 

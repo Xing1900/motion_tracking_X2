@@ -14,6 +14,9 @@ cmd=(
     --ctrl_fps 50
     --lookback_ms "${lookback_ms}"
     --retarget_buffer_window_s 0.5
+    --start_fresh_frames "${START_FRESH_FRAMES:-3}"
+    --start_max_retarget_age_ms "${START_MAX_RETARGET_AGE_MS:-80}"
+    --start_fresh_wait_timeout_ms "${START_FRESH_WAIT_TIMEOUT_MS:-250}"
     --log_interval_s "${log_interval_s}"
     --req_bind_addr tcp://*:28701
     --rep_bind_addr tcp://*:28702
