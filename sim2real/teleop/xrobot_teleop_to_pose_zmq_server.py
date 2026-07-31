@@ -638,8 +638,14 @@ class LowLatencyTeleopPoseZMQServer:
         right_controller_last_update_ns: int,
         source_timeout_ns: int,
     ) -> Dict[str, Any]:
-        def _freshness(source_valid: bool, last_update_ns: int) -> tuple[bool, Optional[float]]:
-            if not source_valid or last_update_ns <= 0:
+        def _freshness(
+            _source_valid: bool, last_update_ns: int
+        ) -> tuple[bool, Optional[float]]:
+            # A single SDK snapshot may omit one controller while the last
+            # valid controller sample is still recent. Apply the configured
+            # grace period to that last valid sample instead of invalidating
+            # the hand stream immediately.
+            if last_update_ns <= 0:
                 return False, None
             age_ns = max(0, int(sample_monotonic_ns) - int(last_update_ns))
             return age_ns <= int(source_timeout_ns), age_ns / 1e6
@@ -783,7 +789,6 @@ class LowLatencyTeleopPoseZMQServer:
         vr_seq = 0
         with self.latest_vr_lock:
             controller_buttons = dict(self.last_controller_buttons)
-            default_buttons = self._default_controller_buttons()
             left_is_new = (
                 left_controller_valid
                 and left_controller_sequence != self.latest_left_controller_update_sequence
@@ -800,10 +805,8 @@ class LowLatencyTeleopPoseZMQServer:
                     for key, value in incoming_controller_buttons.items():
                         if key.startswith(f"{side}_"):
                             controller_buttons[key] = value
-                elif not side_valid:
-                    for key, value in default_buttons.items():
-                        if key.startswith(f"{side}_"):
-                            controller_buttons[key] = value
+                # Keep the last valid values through brief incomplete SDK
+                # snapshots. Freshness is governed by the per-side timestamp.
 
             prev_right_key_one = bool(self.last_controller_buttons.get("right_key_one", False))
             prev_left_key_one = bool(self.last_controller_buttons.get("left_key_one", False))
@@ -1997,7 +2000,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--hand_ctrl_source_timeout_ms",
         type=float,
-        default=200.0,
+        default=500.0,
         help="Mark hand controller samples invalid when the XR callback is older than this",
     )
     parser.add_argument(

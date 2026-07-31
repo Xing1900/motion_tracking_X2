@@ -22,7 +22,7 @@ cmd=(
     --rep_bind_addr tcp://*:28702
     --ctrl_bind_addr tcp://*:28703
     --hand_ctrl_bind_addr tcp://*:28705
-    --hand_ctrl_source_timeout_ms "${HAND_CTRL_SOURCE_TIMEOUT_MS:-200}"
+    --hand_ctrl_source_timeout_ms "${HAND_CTRL_SOURCE_TIMEOUT_MS:-500}"
     --min_link_height 0.0
     --min_link_height_align_strategy startup_fixed
     --min_link_height_bootstrap_frames 10

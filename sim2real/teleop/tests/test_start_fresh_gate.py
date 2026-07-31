@@ -167,6 +167,61 @@ class StartFreshFrameGateTest(unittest.TestCase):
         self.assertGreaterEqual(server.latest_left_controller_recv_monotonic_ns, first_recv_ns)
         self.assertAlmostEqual(server.last_controller_buttons["left_grip_value"], 0.9)
 
+    def test_brief_invalid_snapshot_keeps_last_controller_value_until_timeout(self) -> None:
+        server = _make_controller_callback_server()
+        valid_snapshot = {
+            "timestamp_ns": time.time_ns(),
+            "controllers": {
+                "left": {
+                    "grip": 0.6,
+                    "source_valid": True,
+                    "update_sequence": 1,
+                },
+                "right": {
+                    "grip": 0.4,
+                    "source_valid": True,
+                    "update_sequence": 1,
+                },
+            },
+            "body": {"available": False},
+        }
+        server._on_vr_frame(valid_snapshot)
+        left_recv_ns = server.latest_left_controller_recv_monotonic_ns
+
+        invalid_snapshot = {
+            "timestamp_ns": time.time_ns(),
+            "controllers": {
+                "left": {"source_valid": False, "update_sequence": 1},
+                "right": {
+                    "grip": 0.4,
+                    "source_valid": True,
+                    "update_sequence": 1,
+                },
+            },
+            "body": {"available": False},
+        }
+        server._on_vr_frame(invalid_snapshot)
+
+        self.assertEqual(server.latest_left_controller_recv_monotonic_ns, left_recv_ns)
+        self.assertAlmostEqual(server.last_controller_buttons["left_grip_value"], 0.6)
+        now_ns = time.monotonic_ns()
+        payload = server._build_hand_control_payload(
+            buttons=server.last_controller_buttons,
+            tracking_active=True,
+            sample_monotonic_ns=now_ns,
+            sample_wall_time_ns=time.time_ns(),
+            controller_source_timestamp_ns=123,
+            left_controller_source_valid=False,
+            right_controller_source_valid=True,
+            left_controller_update_sequence=1,
+            right_controller_update_sequence=1,
+            left_controller_last_update_ns=now_ns - int(100e6),
+            right_controller_last_update_ns=now_ns - int(50e6),
+            source_timeout_ns=int(500e6),
+        )
+        self.assertTrue(payload["source_valid"])
+        self.assertAlmostEqual(payload["left"]["grip"], 0.6)
+
     def test_hand_payload_rejects_frozen_controller_source(self) -> None:
         now_ns = time.monotonic_ns()
         buttons = LowLatencyTeleopPoseZMQServer._default_controller_buttons()
