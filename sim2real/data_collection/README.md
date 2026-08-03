@@ -38,7 +38,9 @@ wall and monotonic receive timestamps.
   C++ (before C++ yaw/position anchoring and transition blending).
 - `controller`: 50 Hz normalized PICO button state.
 - `camera_head`: original compressed X2 head-camera frame.
-- `joint_states`: split leg/waist/arm/head `sensor_msgs/JointState` messages.
+- `joint_states`: normalized leg/waist/arm/head state.  Real X2 recording reads
+  `aimdk_msgs/JointStateArray` directly; the stored JSON keeps the same flat
+  name/position/velocity/effort representation used by the converter.
 - `imu_torso`, `imu_chest`: original `sensor_msgs/Imu` data.
 
 The 29-joint action order is copied from `rl_tracking.yaml/BaseConfig.seq`:
@@ -68,25 +70,31 @@ The robot uses ROS domain 0 by default.  On the laptop:
 
 ```bash
 source /opt/ros/humble/setup.bash
+source ~/Documents/motioncontrol/x1-motion-control/x1_digit_mc/install/setup.bash
 export ROS_DOMAIN_ID=0
 export ROS_LOCALHOST_ONLY=0
 export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 
 ros2 topic hz /aima/hal/sensor/rgbd_head_front/rgb_image/compressed
-ros2 topic echo /joint_states/leg --once
-ros2 topic echo /imu/torso/data --once
+ros2 topic echo /aima/hal/joint/leg/state --once
+ros2 topic echo /aima/hal/imu/torso/state --once
 ```
 
 Do not start a real recording until all three are visible.  If only the camera
 is missing, check the camera service and the robot/laptop DDS network profile.
+PICO `Listen` is not required for recording: it only asks the independent
+vision bridge to send H.264 to the headset.  The recorder subscribes directly
+to the compressed ROS image topic.
 
 ## 3. Run the raw recorder on the laptop
 
-Source ROS before invoking the existing GMR virtualenv so `rclpy` and
-`sensor_msgs` are visible:
+Source ROS and the built motion-control workspace before invoking the existing
+GMR virtualenv.  The workspace makes `aimdk_msgs/JointStateArray` type support
+available on the laptop:
 
 ```bash
 source /opt/ros/humble/setup.bash
+source ~/Documents/motioncontrol/x1-motion-control/x1_digit_mc/install/setup.bash
 export ROS_DOMAIN_ID=0
 export ROS_LOCALHOST_ONLY=0
 export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
@@ -96,6 +104,16 @@ cd ~/Documents/motion_tracking/sim2real/data_collection
   --task "touch the red button with the left hand" \
   --output_root ~/Datasets/x2_vr/raw
 ```
+
+The default `--sensor_profile aimdk` reads the real robot topics directly:
+
+```text
+/aima/hal/joint/{leg,waist,arm,head}/state
+/aima/hal/imu/{torso,chest}/state
+```
+
+For simulation or an older deployment that publishes the compatibility topics,
+pass `--sensor_profile compat` to use `/joint_states/*` and `/imu/*/data`.
 
 The camera subscription defaults to ROS sensor-style `best_effort` QoS.  If
 `ros2 topic info -v` shows that your camera publisher is reliable, add

@@ -32,15 +32,37 @@ except ImportError:  # Direct execution from this directory.
 
 
 DEFAULT_CAMERA_TOPIC = "/aima/hal/sensor/rgbd_head_front/rgb_image/compressed"
-DEFAULT_JOINT_TOPICS = [
+DEFAULT_AIMDK_JOINT_TOPICS = [
+    "/aima/hal/joint/leg/state",
+    "/aima/hal/joint/waist/state",
+    "/aima/hal/joint/arm/state",
+    "/aima/hal/joint/head/state",
+]
+DEFAULT_COMPAT_JOINT_TOPICS = [
     "/joint_states/leg",
     "/joint_states/waist",
     "/joint_states/arm",
     "/joint_states/head",
 ]
-DEFAULT_IMU_TOPICS = {
-    "/imu/torso/data": "imu_torso",
-    "/imu/chest/data": "imu_chest",
+DEFAULT_AIMDK_IMU_TOPICS = [
+    "/aima/hal/imu/torso/state",
+    "/aima/hal/imu/chest/state",
+]
+DEFAULT_COMPAT_IMU_TOPICS = [
+    "/imu/torso/data",
+    "/imu/chest/data",
+]
+SENSOR_PROFILES = {
+    "aimdk": {
+        "joint_topics": DEFAULT_AIMDK_JOINT_TOPICS,
+        "imu_topics": DEFAULT_AIMDK_IMU_TOPICS,
+        "joint_message_type": "aimdk_msgs/msg/JointStateArray",
+    },
+    "compat": {
+        "joint_topics": DEFAULT_COMPAT_JOINT_TOPICS,
+        "imu_topics": DEFAULT_COMPAT_IMU_TOPICS,
+        "joint_message_type": "sensor_msgs/msg/JointState",
+    },
 }
 
 
@@ -164,6 +186,51 @@ def _message_receive_times() -> tuple[int, int]:
     return time.monotonic_ns(), time.time_ns()
 
 
+def _joint_state_payload(message: Any) -> Dict[str, Any]:
+    """Normalize AimDK and sensor_msgs joint states into the raw schema."""
+
+    aimdk_joints = getattr(message, "joints", None)
+    if aimdk_joints is not None:
+        payload: Dict[str, Any] = {
+            "name": [str(joint.name) for joint in aimdk_joints],
+            "position": [float(joint.position) for joint in aimdk_joints],
+            "velocity": [float(joint.velocity) for joint in aimdk_joints],
+            "effort": [float(joint.effort) for joint in aimdk_joints],
+            "error_code": [int(joint.error_code) for joint in aimdk_joints],
+            "source_message_type": "aimdk_msgs/msg/JointStateArray",
+        }
+        domain_state = getattr(getattr(message, "state", None), "value", None)
+        if domain_state is not None:
+            payload["domain_state"] = int(domain_state)
+        return payload
+
+    return {
+        "name": [str(name) for name in message.name],
+        "position": [float(value) for value in message.position],
+        "velocity": [float(value) for value in message.velocity],
+        "effort": [float(value) for value in message.effort],
+        "source_message_type": "sensor_msgs/msg/JointState",
+    }
+
+
+def _imu_stream_name(topic: str, index: int) -> str:
+    topic_lower = str(topic).lower()
+    if "torso" in topic_lower:
+        return "imu_torso"
+    if "chest" in topic_lower:
+        return "imu_chest"
+    return "imu_torso" if index == 0 else f"imu_{index}"
+
+
+def _required_joint_topics(topics: list[str]) -> list[str]:
+    required_groups = {"leg", "waist", "arm"}
+    return [
+        str(topic)
+        for topic in topics
+        if required_groups.intersection(part for part in str(topic).split("/") if part)
+    ]
+
+
 def _build_ros_node(ingress: IngressQueue, args: argparse.Namespace) -> Any:
     try:
         import rclpy
@@ -182,6 +249,18 @@ def _build_ros_node(ingress: IngressQueue, args: argparse.Namespace) -> Any:
             "ROS Python packages are unavailable. Source /opt/ros/humble/setup.bash before "
             "running the gmr virtualenv, or pass --disable_ros for a reference-only recording."
         ) from exc
+
+    joint_message_type: Any = JointState
+    if args.sensor_profile == "aimdk":
+        try:
+            from aimdk_msgs.msg import JointStateArray
+        except ImportError as exc:
+            raise ImportError(
+                "AimDK ROS messages are unavailable. Source the built "
+                "x1_digit_mc/install/setup.bash after /opt/ros/humble/setup.bash, "
+                "or use --sensor_profile compat when compatibility topics exist."
+            ) from exc
+        joint_message_type = JointStateArray
 
     class X2SensorRecorderNode(Node):
         def __init__(self) -> None:
@@ -218,7 +297,7 @@ def _build_ros_node(ingress: IngressQueue, args: argparse.Namespace) -> Any:
             for topic in args.joint_topics:
                 self._owned_subscriptions.append(
                     self.create_subscription(
-                        JointState,
+                        joint_message_type,
                         topic,
                         lambda message, source_topic=topic: self._on_joint_state(
                             source_topic, message
@@ -228,9 +307,8 @@ def _build_ros_node(ingress: IngressQueue, args: argparse.Namespace) -> Any:
                     )
                 )
 
-            for topic, stream in DEFAULT_IMU_TOPICS.items():
-                if topic not in args.imu_topics:
-                    continue
+            for index, topic in enumerate(args.imu_topics):
+                stream = _imu_stream_name(topic, index)
                 self._owned_subscriptions.append(
                     self.create_subscription(
                         Imu,
@@ -275,15 +353,7 @@ def _build_ros_node(ingress: IngressQueue, args: argparse.Namespace) -> Any:
             event = self._base_event(
                 "joint_states", ros_stamp_to_ns(message.header.stamp), message.header.frame_id
             )
-            event.update(
-                {
-                    "topic": topic,
-                    "name": [str(name) for name in message.name],
-                    "position": [float(value) for value in message.position],
-                    "velocity": [float(value) for value in message.velocity],
-                    "effort": [float(value) for value in message.effort],
-                }
-            )
+            event.update({"topic": topic, **_joint_state_payload(message)})
             ingress.put(event)
 
         def _on_imu(self, topic: str, stream: str, message: Any) -> None:
@@ -343,6 +413,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--queue_size", type=int, default=8192)
     parser.add_argument("--status_interval_s", type=float, default=2.0)
     parser.add_argument("--disable_ros", action="store_true")
+    parser.add_argument(
+        "--sensor_profile",
+        choices=sorted(SENSOR_PROFILES),
+        default="aimdk",
+        help=(
+            "ROS sensor transport: 'aimdk' subscribes directly to the real X2 HAL "
+            "topics; 'compat' uses sensor_msgs compatibility relay topics"
+        ),
+    )
     parser.add_argument("--camera_topic", default=DEFAULT_CAMERA_TOPIC)
     parser.add_argument(
         "--camera_qos_reliability",
@@ -350,9 +429,25 @@ def parse_args() -> argparse.Namespace:
         default="best_effort",
         help="Camera subscription reliability (sensor streams normally use best_effort)",
     )
-    parser.add_argument("--joint_topics", nargs="+", default=DEFAULT_JOINT_TOPICS)
-    parser.add_argument("--imu_topics", nargs="+", default=list(DEFAULT_IMU_TOPICS))
-    return parser.parse_args()
+    parser.add_argument(
+        "--joint_topics",
+        nargs="+",
+        default=None,
+        help="Override the joint topics selected by --sensor_profile",
+    )
+    parser.add_argument(
+        "--imu_topics",
+        nargs="+",
+        default=None,
+        help="Override the IMU topics selected by --sensor_profile (torso first)",
+    )
+    args = parser.parse_args()
+    profile = SENSOR_PROFILES[args.sensor_profile]
+    if args.joint_topics is None:
+        args.joint_topics = list(profile["joint_topics"])
+    if args.imu_topics is None:
+        args.imu_topics = list(profile["imu_topics"])
+    return args
 
 
 def main() -> None:
@@ -374,6 +469,8 @@ def main() -> None:
         "tap_addr": args.tap_addr,
         "camera_topic": None if args.disable_ros else args.camera_topic,
         "camera_qos_reliability": args.camera_qos_reliability,
+        "sensor_profile": args.sensor_profile,
+        "joint_message_type": SENSOR_PROFILES[args.sensor_profile]["joint_message_type"],
         "joint_topics": [] if args.disable_ros else list(args.joint_topics),
         "imu_topics": [] if args.disable_ros else list(args.imu_topics),
         "ros_domain_id": os.environ.get("ROS_DOMAIN_ID", "0"),
@@ -406,7 +503,7 @@ def main() -> None:
         ),
         "required_joint_names": [] if args.disable_ros else list(X2_TRACKING_JOINT_NAMES),
         "required_joint_topics": (
-            [] if args.disable_ros else list(DEFAULT_JOINT_TOPICS[:3])
+            [] if args.disable_ros else _required_joint_topics(args.joint_topics)
         ),
         "max_joint_topic_gap_s": 0.0 if args.disable_ros else 0.5,
     }

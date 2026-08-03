@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -21,7 +22,15 @@ from convert_to_lerobot import (  # noqa: E402
 )
 from raw_episode_writer import RawEpisodeManager, RawEpisodeWriter  # noqa: E402
 from schema import ACTION_NAMES, X2_TRACKING_JOINT_NAMES  # noqa: E402
-from x2_vr_recorder import IngressQueue  # noqa: E402
+from x2_vr_recorder import (  # noqa: E402
+    DEFAULT_AIMDK_IMU_TOPICS,
+    DEFAULT_AIMDK_JOINT_TOPICS,
+    IngressQueue,
+    SENSOR_PROFILES,
+    _imu_stream_name,
+    _joint_state_payload,
+    _required_joint_topics,
+)
 
 
 VALID_PNG = base64.b64decode(
@@ -129,6 +138,85 @@ class RawEpisodeManagerTest(unittest.TestCase):
             manifest = json.loads((episode / "manifest.json").read_text(encoding="utf-8"))
             self.assertEqual(manifest["status"], "invalid")
             self.assertEqual(manifest["validation"]["missing_streams"], ["camera_head"])
+
+
+class RecorderSensorAdapterTest(unittest.TestCase):
+    def test_aimdk_profile_uses_real_x2_hal_topics(self):
+        self.assertEqual(
+            SENSOR_PROFILES["aimdk"]["joint_message_type"],
+            "aimdk_msgs/msg/JointStateArray",
+        )
+        self.assertEqual(
+            DEFAULT_AIMDK_JOINT_TOPICS[:3],
+            [
+                "/aima/hal/joint/leg/state",
+                "/aima/hal/joint/waist/state",
+                "/aima/hal/joint/arm/state",
+            ],
+        )
+        self.assertEqual(
+            DEFAULT_AIMDK_IMU_TOPICS,
+            [
+                "/aima/hal/imu/torso/state",
+                "/aima/hal/imu/chest/state",
+            ],
+        )
+
+    def test_aimdk_joint_state_array_is_normalized(self):
+        message = SimpleNamespace(
+            state=SimpleNamespace(value=0),
+            joints=[
+                SimpleNamespace(
+                    name="left_hip_pitch_joint",
+                    position=-0.3,
+                    velocity=0.02,
+                    effort=1.5,
+                    error_code=7,
+                ),
+                SimpleNamespace(
+                    name="left_hip_roll_joint",
+                    position=0.1,
+                    velocity=-0.01,
+                    effort=0.5,
+                    error_code=0,
+                ),
+            ],
+        )
+
+        payload = _joint_state_payload(message)
+
+        self.assertEqual(
+            payload["name"], ["left_hip_pitch_joint", "left_hip_roll_joint"]
+        )
+        self.assertEqual(payload["position"], [-0.3, 0.1])
+        self.assertEqual(payload["velocity"], [0.02, -0.01])
+        self.assertEqual(payload["effort"], [1.5, 0.5])
+        self.assertEqual(payload["error_code"], [7, 0])
+        self.assertEqual(payload["domain_state"], 0)
+
+    def test_sensor_msgs_joint_state_remains_supported(self):
+        message = SimpleNamespace(
+            name=["waist_yaw_joint"],
+            position=[0.2],
+            velocity=[-0.1],
+            effort=[0.0],
+        )
+
+        payload = _joint_state_payload(message)
+
+        self.assertEqual(payload["name"], ["waist_yaw_joint"])
+        self.assertEqual(payload["position"], [0.2])
+        self.assertEqual(payload["velocity"], [-0.1])
+        self.assertEqual(payload["source_message_type"], "sensor_msgs/msg/JointState")
+        self.assertNotIn("error_code", payload)
+
+    def test_real_profile_validation_requires_leg_waist_and_arm(self):
+        self.assertEqual(
+            _required_joint_topics(DEFAULT_AIMDK_JOINT_TOPICS),
+            DEFAULT_AIMDK_JOINT_TOPICS[:3],
+        )
+        self.assertEqual(_imu_stream_name(DEFAULT_AIMDK_IMU_TOPICS[0], 0), "imu_torso")
+        self.assertEqual(_imu_stream_name(DEFAULT_AIMDK_IMU_TOPICS[1], 1), "imu_chest")
 
 
 class ConversionTest(unittest.TestCase):
