@@ -70,6 +70,38 @@ X2_JOINT_NAMES = [
     "right_wrist_roll_joint",
 ]
 
+GP02_V3_JOINT_NAMES = [
+    "left_hip_pitch_joint",
+    "left_hip_roll_joint",
+    "left_hip_yaw_joint",
+    "left_knee_joint",
+    "left_ankle_pitch_joint",
+    "left_ankle_roll_joint",
+    "right_hip_pitch_joint",
+    "right_hip_roll_joint",
+    "right_hip_yaw_joint",
+    "right_knee_joint",
+    "right_ankle_pitch_joint",
+    "right_ankle_roll_joint",
+    "waist_yaw_joint",
+    "waist_roll_joint",
+    "left_shoulder_pitch_joint",
+    "left_shoulder_roll_joint",
+    "left_shoulder_yaw_joint",
+    "left_elbow_joint",
+    "left_wrist_yaw_joint",
+    "right_shoulder_pitch_joint",
+    "right_shoulder_roll_joint",
+    "right_shoulder_yaw_joint",
+    "right_elbow_joint",
+    "right_wrist_yaw_joint",
+]
+
+ROBOT_JOINT_NAMES = {
+    "agibot_x2": X2_JOINT_NAMES,
+    "gp02_v3": GP02_V3_JOINT_NAMES,
+}
+
 
 def upsample_scalar(data: np.ndarray, src_fps: float, tgt_fps: float) -> np.ndarray:
     """Linear interpolation for scalar/position data."""
@@ -119,7 +151,12 @@ def upsample_rotations(quat_xyzw: np.ndarray, src_fps: float, tgt_fps: float) ->
     return interp_rots.as_quat().astype(quat_xyzw.dtype)
 
 
-def convert_pkl_to_npz(input_path: Path, output_path: Path, target_fps: float = 50.0) -> None:
+def convert_pkl_to_npz(
+    input_path: Path,
+    output_path: Path,
+    target_fps: float = 50.0,
+    robot: str = "agibot_x2",
+) -> None:
     motion_data = _load_pickle(input_path)
     if not isinstance(motion_data, dict):
         raise TypeError(f"Expected top-level pickle object to be dict, got {type(motion_data)!r}")
@@ -134,13 +171,16 @@ def convert_pkl_to_npz(input_path: Path, output_path: Path, target_fps: float = 
         raise KeyError(f"Missing body names in {input_path}")
     body_names = [str(n) for n in body_names]
 
+    joint_names = ROBOT_JOINT_NAMES[robot]
+
     # Sanity checks.
     n_frames = root_pos.shape[0]
     assert root_rot.shape[0] == n_frames
     assert dof_pos.shape[0] == n_frames
     assert local_body_pos.shape[0] == n_frames
-    assert dof_pos.shape[1] == len(X2_JOINT_NAMES), (
-        f"dof_pos has {dof_pos.shape[1]} joints, expected {len(X2_JOINT_NAMES)}"
+    assert dof_pos.shape[1] == len(joint_names), (
+        f"dof_pos has {dof_pos.shape[1]} joints, expected {len(joint_names)} "
+        f"for robot={robot}"
     )
     assert local_body_pos.shape[1] == len(body_names), (
         f"local_body_pos has {local_body_pos.shape[1]} bodies, expected {len(body_names)}"
@@ -162,7 +202,7 @@ def convert_pkl_to_npz(input_path: Path, output_path: Path, target_fps: float = 
         "dof_pos": dof_pos,
         "local_body_pos": local_body_pos,
         "body_names": np.array(body_names, dtype=object),
-        "joint_names": np.array(X2_JOINT_NAMES, dtype=object),
+        "joint_names": np.array(joint_names, dtype=object),
     }
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -177,6 +217,12 @@ def main() -> None:
     parser.add_argument("--output", "-o", type=Path, default=None, help="Output .npz file or directory.")
     parser.add_argument("--target-fps", type=float, default=50.0, help="Target frame rate (default: 50).")
     parser.add_argument("--num-cpus", type=int, default=1, help="Number of parallel workers.")
+    parser.add_argument(
+        "--robot",
+        choices=sorted(ROBOT_JOINT_NAMES),
+        default="agibot_x2",
+        help="Robot joint layout stored in the GMR pickle.",
+    )
     args = parser.parse_args()
 
     input_path = args.input.expanduser().resolve()
@@ -211,11 +257,14 @@ def main() -> None:
         with Pool(args.num_cpus) as pool:
             pool.starmap(
                 convert_pkl_to_npz,
-                [(src, dst, args.target_fps) for src, dst in zip(pkl_files, output_paths)],
+                [
+                    (src, dst, args.target_fps, args.robot)
+                    for src, dst in zip(pkl_files, output_paths)
+                ],
             )
     else:
         for src, dst in zip(pkl_files, output_paths):
-            convert_pkl_to_npz(src, dst, args.target_fps)
+            convert_pkl_to_npz(src, dst, args.target_fps, args.robot)
 
 
 if __name__ == "__main__":
