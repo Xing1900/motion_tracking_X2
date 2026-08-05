@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Record X2 VR demonstrations without touching the real-time control path.
 
-The process subscribes to the teleop bridge's independent PUB tap and, when
-ROS is enabled, to the robot's compressed head camera, split joint states and
-IMUs.  Right ``key_one`` starts an episode; left ``key_one`` stops it.
+The process subscribes to the teleop bridge's independent PUB tap, robot joint
+states and IMUs, plus either the robot-side camera TCP tap or the legacy ROS
+camera topic.  Right ``key_one`` starts an episode; left ``key_one`` stops it.
 
 This writes a loss-preserving raw format.  Conversion/resampling into a
 LeRobotDataset happens offline in ``convert_to_lerobot.py``.
@@ -24,9 +24,11 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 try:
+    from .camera_tap_client import CameraTapClient
     from .raw_episode_writer import RawEpisodeManager, ros_stamp_to_ns
     from .schema import TELEOP_TAP_SCHEMA_VERSION, X2_TRACKING_JOINT_NAMES
 except ImportError:  # Direct execution from this directory.
+    from camera_tap_client import CameraTapClient
     from raw_episode_writer import RawEpisodeManager, ros_stamp_to_ns
     from schema import TELEOP_TAP_SCHEMA_VERSION, X2_TRACKING_JOINT_NAMES
 
@@ -283,7 +285,7 @@ def _build_ros_node(ingress: IngressQueue, args: argparse.Namespace) -> Any:
                 durability=QoSDurabilityPolicy.VOLATILE,
             )
 
-            if args.camera_topic:
+            if args.camera_topic and not args.camera_tap_addr:
                 self._owned_subscriptions.append(
                     self.create_subscription(
                         CompressedImage,
@@ -321,9 +323,14 @@ def _build_ros_node(ingress: IngressQueue, args: argparse.Namespace) -> Any:
                     )
                 )
 
+            camera_source = (
+                f"<tcp tap {args.camera_tap_addr}>"
+                if args.camera_tap_addr
+                else (args.camera_topic or "<disabled>")
+            )
             self.get_logger().info(
-                f"camera={args.camera_topic or '<disabled>'}, "
-                f"joint_topics={args.joint_topics}, imu_topics={args.imu_topics}"
+                f"camera={camera_source}, joint_topics={args.joint_topics}, "
+                f"imu_topics={args.imu_topics}"
             )
 
         def _base_event(self, stream: str, source_stamp_ns: int, frame_id: str) -> Dict[str, Any]:
@@ -424,6 +431,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--camera_topic", default=DEFAULT_CAMERA_TOPIC)
     parser.add_argument(
+        "--camera_tap_addr",
+        default="",
+        help=(
+            "Optional robot-side compressed-camera TCP tap (tcp://host:port). "
+            "When set, camera ROS subscription is skipped while joint/IMU ROS "
+            "subscriptions remain enabled."
+        ),
+    )
+    parser.add_argument(
         "--camera_qos_reliability",
         choices=["reliable", "best_effort"],
         default="best_effort",
@@ -464,10 +480,41 @@ def main() -> None:
 
     output_root = Path(args.output_root).expanduser().resolve()
     ingress = IngressQueue(args.queue_size)
+    camera_tap = (
+        CameraTapClient(
+            args.camera_tap_addr,
+            on_event=ingress.put,
+            note_drop=ingress.note_drop,
+        )
+        if args.camera_tap_addr
+        else None
+    )
+    camera_enabled = bool(camera_tap) or (
+        not args.disable_ros and bool(args.camera_topic)
+    )
+    required_streams = ["controller", "reference"]
+    minimum_stream_counts = {"controller": 2, "reference": 2}
+    max_stream_gap_s = {"controller": 1.0, "reference": 0.5}
+    if camera_enabled:
+        required_streams.append("camera_head")
+        minimum_stream_counts["camera_head"] = 2
+        max_stream_gap_s["camera_head"] = 0.5
+    if not args.disable_ros:
+        required_streams.extend(["joint_states", "imu_torso"])
+        minimum_stream_counts.update({"joint_states": 3, "imu_torso": 2})
+        max_stream_gap_s["imu_torso"] = 0.5
     source_config = {
         "hostname": socket.gethostname(),
         "tap_addr": args.tap_addr,
-        "camera_topic": None if args.disable_ros else args.camera_topic,
+        "camera_topic": (
+            None if args.disable_ros or camera_tap is not None else args.camera_topic
+        ),
+        "camera_tap_addr": args.camera_tap_addr or None,
+        "camera_transport": (
+            "tcp_tap"
+            if camera_tap is not None
+            else ("ros" if camera_enabled else "disabled")
+        ),
         "camera_qos_reliability": args.camera_qos_reliability,
         "sensor_profile": args.sensor_profile,
         "joint_message_type": SENSOR_PROFILES[args.sensor_profile]["joint_message_type"],
@@ -475,32 +522,9 @@ def main() -> None:
         "imu_topics": [] if args.disable_ros else list(args.imu_topics),
         "ros_domain_id": os.environ.get("ROS_DOMAIN_ID", "0"),
         "ros_localhost_only": os.environ.get("ROS_LOCALHOST_ONLY", "0"),
-        "required_streams": (
-            ["controller", "reference"]
-            if args.disable_ros
-            else ["controller", "reference", "camera_head", "joint_states", "imu_torso"]
-        ),
-        "minimum_stream_counts": (
-            {"controller": 2, "reference": 2}
-            if args.disable_ros
-            else {
-                "controller": 2,
-                "reference": 2,
-                "camera_head": 2,
-                "joint_states": 3,
-                "imu_torso": 2,
-            }
-        ),
-        "max_stream_gap_s": (
-            {"controller": 1.0, "reference": 0.5}
-            if args.disable_ros
-            else {
-                "controller": 1.0,
-                "reference": 0.5,
-                "camera_head": 0.5,
-                "imu_torso": 0.5,
-            }
-        ),
+        "required_streams": required_streams,
+        "minimum_stream_counts": minimum_stream_counts,
+        "max_stream_gap_s": max_stream_gap_s,
         "required_joint_names": [] if args.disable_ros else list(X2_TRACKING_JOINT_NAMES),
         "required_joint_topics": (
             [] if args.disable_ros else _required_joint_topics(args.joint_topics)
@@ -559,12 +583,22 @@ def main() -> None:
     dispatcher.start()
     if ros_thread is not None:
         ros_thread.start()
+    if camera_tap is not None:
+        camera_tap.start()
 
     print(f"[recorder] output: {output_root}")
     print(f"[recorder] teleop tap: {args.tap_addr}")
+    if camera_tap is not None:
+        print(f"[recorder] camera tap: {args.camera_tap_addr} (ROS camera disabled)")
     print("[recorder] waiting: right key_one starts; left key_one stops and saves")
     if args.disable_ros:
-        print("[recorder] ROS disabled: this run records XR/reference/controller only")
+        if camera_tap is not None:
+            print(
+                "[recorder] ROS disabled: recording XR/reference/controller and "
+                "the camera TCP tap; joints/IMUs are disabled"
+            )
+        else:
+            print("[recorder] ROS disabled: this run records XR/reference/controller only")
 
     next_status_time = time.monotonic() + max(0.1, args.status_interval_s)
     last_tap_seq: Optional[int] = None
@@ -625,10 +659,20 @@ def main() -> None:
 
             now = time.monotonic()
             if now >= next_status_time:
+                camera_status = camera_tap.status() if camera_tap is not None else None
+                camera_text = (
+                    f", camera_tap="
+                    f"{'connected' if camera_status.connected else 'reconnecting'}"
+                    f"/frames={camera_status.received_frames}"
+                    f"/gaps={camera_status.transport_gaps}"
+                    if camera_status is not None
+                    else ""
+                )
                 print(
                     f"[recorder] state={manager.state}, episode={manager.current_episode_index}, "
                     f"queue={ingress.size()}/{args.queue_size} (peak={ingress.peak_size()}), "
                     f"received={ingress.counts()}, dropped={ingress.drops()}"
+                    f"{camera_text}"
                 )
                 next_status_time = now + max(0.1, args.status_interval_s)
     except KeyboardInterrupt:
@@ -637,6 +681,9 @@ def main() -> None:
         signal.signal(signal.SIGTERM, previous_sigterm_handler)
         poller.unregister(tap_socket)
         tap_socket.close(0)
+
+        if camera_tap is not None:
+            camera_tap.close()
 
         if ros_executor is not None:
             ros_executor.shutdown(timeout_sec=2.0)

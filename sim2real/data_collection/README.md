@@ -8,10 +8,9 @@ PICO/XRoboToolkit -> GMR teleop bridge -> rl_tracking
                          | recorder PUB tap
                          v
                  x2_vr_recorder.py
-                         ^
-                         | ROS 2 camera/joints/IMU
-                         |
-                       X2 robot
+                    ^             ^
+       camera TCP tap |             | ROS 2 joints/IMU
+                    X2 vision bridge
 ```
 
 Code belongs in `motion_tracking/sim2real/data_collection`.  Large recordings
@@ -37,7 +36,8 @@ wall and monotonic receive timestamps.
 - `reference`: the interpolated frame actually sent by the Python bridge to
   C++ (before C++ yaw/position anchoring and transition blending).
 - `controller`: 50 Hz normalized PICO button state.
-- `camera_head`: original compressed X2 head-camera frame.
+- `camera_head`: original compressed X2 head-camera frame, normally received
+  from the robot-side vision bridge TCP tap on port 28706.
 - `joint_states`: normalized leg/waist/arm/head state.  Real X2 recording reads
   `aimdk_msgs/JointStateArray` directly; the stored JSON keeps the same flat
   name/position/velocity/effort representation used by the converter.
@@ -64,7 +64,18 @@ to the normal X2 bridge command.  After restarting, it should print:
 The bridge queues tap events without blocking control.  Every tap event also
 has a continuous `tap_seq`; the recorder reports transport gaps.
 
-## 2. Check that the laptop can see robot ROS topics
+## 2. Start the camera tap and check robot sensors
+
+Start the deployed vision bridge on the robot normally.  Its default
+configuration enables the recorder tap on `0.0.0.0:28706`; look for:
+
+```text
+camera recorder tap listening on 0.0.0.0:28706
+```
+
+The tap forwards the original compressed ROS image, keeps at most the newest
+pending frame, and never performs socket work in the camera callback.  Verify
+the robot is listening with `ss -ltnp | grep 28706`.
 
 The robot uses ROS domain 0 by default.  On the laptop:
 
@@ -75,16 +86,15 @@ export ROS_DOMAIN_ID=0
 export ROS_LOCALHOST_ONLY=0
 export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 
-ros2 topic hz /aima/hal/sensor/rgbd_head_front/rgb_image/compressed
 ros2 topic echo /aima/hal/joint/leg/state --once
 ros2 topic echo /aima/hal/imu/torso/state --once
 ```
 
-Do not start a real recording until all three are visible.  If only the camera
-is missing, check the camera service and the robot/laptop DDS network profile.
-PICO `Listen` is not required for recording: it only asks the independent
-vision bridge to send H.264 to the headset.  The recorder subscribes directly
-to the compressed ROS image topic.
+The AimDK camera publisher is bound to a robot-internal Fast DDS interface, so
+the laptop does not need to discover its ROS topic.  The recorder receives the
+compressed frame over the separate TCP tap while joints and IMUs still use ROS.
+PICO `Listen` is not required: it controls only the independent H.264 headset
+output, not the recorder tap.
 
 ## 3. Run the raw recorder on the laptop
 
@@ -101,9 +111,17 @@ export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 
 cd ~/Documents/motion_tracking/sim2real/data_collection
 ~/Documents/gmr/.venv/bin/python x2_vr_recorder.py \
+  --tap_addr tcp://172.66.88.241:28704 \
+  --camera_tap_addr tcp://172.66.88.241:28706 \
   --task "touch the red button with the left hand" \
   --output_root ~/Datasets/x2_vr/raw
 ```
+
+With `--camera_tap_addr` enabled, the recorder automatically skips its ROS
+camera subscription but retains all ROS joint and IMU subscriptions.  The
+camera client reconnects after a bridge/network interruption, and sequence
+gaps are recorded as `camera_tap_transport` ingress drops.  Replace
+`172.66.88.241` if the robot IP changes.
 
 The default `--sensor_profile aimdk` reads the real robot topics directly:
 
@@ -115,7 +133,8 @@ The default `--sensor_profile aimdk` reads the real robot topics directly:
 For simulation or an older deployment that publishes the compatibility topics,
 pass `--sensor_profile compat` to use `/joint_states/*` and `/imu/*/data`.
 
-The camera subscription defaults to ROS sensor-style `best_effort` QoS.  If
+Without `--camera_tap_addr`, the legacy direct ROS camera subscription remains
+available and defaults to sensor-style `best_effort` QoS.  If
 `ros2 topic info -v` shows that your camera publisher is reliable, add
 `--camera_qos_reliability reliable`.
 
@@ -228,6 +247,6 @@ aligned/consumed reference or `/joint_cmd/*` streams.
 The raw data remains the source of truth, so alternative local/delta action
 representations can be generated later without repeating a demonstration.
 
-Run the bridge and recorder on the same laptop.  Synchronization uses the
-recorder's monotonic receive clock; device, ROS, and bridge timestamps remain
-in the raw files for latency diagnostics.
+Synchronization uses the recorder laptop's monotonic receive clock; device,
+ROS, bridge and camera-tap timestamps remain in the raw files for latency
+diagnostics.
