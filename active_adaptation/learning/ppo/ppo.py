@@ -1,5 +1,6 @@
 import warnings
 import copy
+import re
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Dict, List, Union
@@ -272,6 +273,14 @@ class PPOPolicy(TensorDictModuleBase):
         base_scale = float(self.cfg.init_noise_scale)
         overrides = getattr(self.cfg, "init_noise_scale_overrides", None) or {}
         overrides = dict(overrides)
+        # A task may deliberately expose only a subset of the model joints to
+        # the policy (for example, GP02 locks both waist joints). Ignore noise
+        # overrides that only refer to joints outside that action space.
+        overrides = {
+            pattern: value
+            for pattern, value in overrides.items()
+            if any(re.fullmatch(pattern, name) for name in self.joint_names)
+        }
         if not overrides:
             return base_scale
 

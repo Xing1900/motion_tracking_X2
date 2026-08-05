@@ -39,6 +39,7 @@ class ProgressiveMultiMotionDataset:
         fix_ds: int = None,
         fix_motion_id: int = None,
         motion_fps: float = 50.0,
+        reference_joint_pos_overrides: dict[str, float] | None = None,
     ):
         self.device = device
         self.ds_device = ds_device
@@ -68,6 +69,24 @@ class ProgressiveMultiMotionDataset:
             if ds.joint_names != joint0:
                 raise ValueError("All datasets must resolve to the same joint_names")
         self.joint_names = joint0
+        self.reference_joint_pos_overrides = dict(reference_joint_pos_overrides or {})
+        unknown_override_names = sorted(
+            set(self.reference_joint_pos_overrides) - set(self.joint_names)
+        )
+        if unknown_override_names:
+            raise ValueError(
+                f"Reference joint overrides are not present in the dataset: {unknown_override_names}"
+            )
+        self.reference_override_joint_ids = torch.tensor(
+            [self.joint_names.index(name) for name in self.reference_joint_pos_overrides],
+            device=self.device,
+            dtype=torch.long,
+        )
+        self.reference_override_joint_values = torch.tensor(
+            list(self.reference_joint_pos_overrides.values()),
+            device=self.device,
+            dtype=torch.float32,
+        )
         self.body_names = _select_required_body_names(fk_asset.body_names, self.required_motion_body_patterns)
         self._fk_helper = MotionFKHelper.from_mjlab_asset(
             asset=fk_asset,
@@ -232,6 +251,11 @@ class ProgressiveMultiMotionDataset:
             local_idx = (local_starts.unsqueeze(1) + steps).clamp(max=local_ends.unsqueeze(1))
 
             minimal = ds.data[local_idx].to(self.device)
+            if self.reference_override_joint_ids.numel() > 0:
+                minimal = minimal.clone()
+                minimal.joint_pos[..., self.reference_override_joint_ids] = (
+                    self.reference_override_joint_values.to(dtype=minimal.joint_pos.dtype)
+                )
             full = self._fk_helper.expand_minimal_motion(minimal, fps=self.motion_fps)
             self._buf_A[env_mask] = self._to_float(full, dtype=self._buf_A.root_pos_w.dtype)
             self._len_A[env_mask] = ds.lengths[motion_ids_long].clamp_max(self.max_step_size).to(self.device)

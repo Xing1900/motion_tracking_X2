@@ -1,6 +1,6 @@
 import torch
 import einops
-from typing import Dict, Literal, Tuple, Union, TYPE_CHECKING
+from typing import Dict, Literal, Sequence, Tuple, Union, TYPE_CHECKING
 from tensordict import TensorDictBase
 import mjlab.utils.lab_api.string as string_utils
 import active_adaptation.utils.symmetry as symmetry_utils
@@ -45,6 +45,7 @@ class JointPosition(ActionManager):
         self,
         env,
         action_scaling: Dict[str, float] | float = 0.5,
+        joint_names: str | Sequence[str] = ".*",
         max_delay: int | None = None,
         delay_full_progress: float = 1.0,
         boot_delay_steps: int = 0,
@@ -57,7 +58,7 @@ class JointPosition(ActionManager):
         # ------------------------------------------------------------------ cfg
         self.joint_ids, self.joint_names, self.action_scaling = (
             joint_order_utils.resolve_joint_order_with_values(
-                self.asset, dict(action_scaling)
+                self.asset, dict(action_scaling), joint_names=joint_names
             )
         )
         self.action_scaling = torch.tensor(self.action_scaling, device=self.device)

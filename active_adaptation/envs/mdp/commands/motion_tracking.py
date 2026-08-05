@@ -39,7 +39,10 @@ def _match_indices(motion_names, asset_names, patterns, name_map=None, device=No
                 motion_idx.append(motion_names.index(m))
                 if debug:
                     print(f"Matched asset '{a}' (idx {i}) to motion '{m}' (idx {motion_names.index(m)})")
-    return torch.tensor(motion_idx, device=device), torch.tensor(asset_idx, device=device)
+    return (
+        torch.tensor(motion_idx, device=device, dtype=torch.long),
+        torch.tensor(asset_idx, device=device, dtype=torch.long),
+    )
 
 def _calc_exp_sigma(error : torch.Tensor, sigma_list : list[float], reduce_last_dim : bool = False):
     if sigma_list is None or len(sigma_list) == 0:
@@ -127,6 +130,7 @@ class MotionTrackingCommand(Command):
                 upper_keypoint_patterns: list[str] = [],
                 joint_patterns: list[str] = [],
                 ignore_joint_patterns: list[str] = [],
+                locked_joint_patterns: list[str] = [],
                 feet_patterns: list[str] = [],
                 feet_standing_z_enter: float = 0.12,
                 feet_standing_z_exit: float = 0.15,
@@ -251,23 +255,39 @@ class MotionTrackingCommand(Command):
         self.feet_standing_vz_enter = float(feet_standing_vz_enter)
         self.feet_standing_vz_exit = float(feet_standing_vz_exit)
 
-        # all joints except ankles
+        # Joints locked by the controller remain in the model/dataset, but are
+        # excluded from motion initialization and target observations.
+        self.locked_joint_patterns = list(locked_joint_patterns)
+        canonical_joint_names = joint_order_utils.get_joint_name_order(self.asset)
+        self.locked_joint_names = [
+            name for name in canonical_joint_names
+            if any(re.fullmatch(pattern, name) for pattern in self.locked_joint_patterns)
+        ]
+        asset_name_to_idx = {name: idx for idx, name in enumerate(self.asset.joint_names)}
+        self.locked_joint_idx_asset = torch.tensor(
+            [asset_name_to_idx[name] for name in self.locked_joint_names],
+            device=self.device,
+            dtype=torch.long,
+        )
+
+        # Joints used when sampling an initial state from a reference motion.
         self.ignore_joint_patterns = ignore_joint_patterns
         self.all_joint_names, self.all_joint_idx_dataset, self.all_joint_idx_asset = _resolve_joint_indices(
             self.dataset.joint_names,
             self.asset.joint_names,
             self.asset.joint_names,
-            ignore_patterns=self.ignore_joint_patterns,
+            ignore_patterns=[*self.ignore_joint_patterns, *self.locked_joint_patterns],
             strict=False,
             device=self.device,
             context="all_joint_idx",
         )
 
-        # joint indices for target_joint_pos_obs: follow asset-configured canonical order.
+        # Target joint observations follow canonical order, excluding locked joints.
         self.target_joint_names, self.target_joint_idx_motion, self.target_joint_idx_asset = _resolve_joint_indices(
             self.dataset.joint_names,
             self.asset.joint_names,
-            joint_order_utils.get_joint_name_order(self.asset),
+            canonical_joint_names,
+            ignore_patterns=self.locked_joint_patterns,
             strict=True,
             device=self.device,
             context="asset canonical order",
@@ -445,6 +465,14 @@ class MotionTrackingCommand(Command):
         joint_vel_noise = torch.randn_like(init_joint_vel).clamp(-1, 1) * self.init_noise_params["joint_vel"]
         init_joint_pos += joint_pos_noise
         init_joint_vel += joint_vel_noise
+
+        # A locked joint starts exactly at its configured default and with zero
+        # velocity. The position action manager keeps commanding that default.
+        if self.locked_joint_idx_asset.numel() > 0:
+            init_joint_pos[:, self.locked_joint_idx_asset] = self.init_joint_pos[
+                env_ids
+            ][:, self.locked_joint_idx_asset]
+            init_joint_vel[:, self.locked_joint_idx_asset] = 0.0
 
         # Apply the calculated states to the simulation
         self.asset.write_root_state_to_sim(init_root_state, env_ids=env_ids)
