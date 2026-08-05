@@ -1,0 +1,18 @@
+[Unit]
+Description=GP02 MotionTracking stage-1 training with automatic checkpoint resume
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/liuguoxing/Documents/motion_tracking
+Environment=PYTHONUNBUFFERED=1
+Environment=MPLCONFIGDIR=/tmp/gp02-matplotlib-cache
+ExecStart=/bin/bash /home/liuguoxing/Documents/motion_tracking/scripts/gp02_train_stage1.sh
+StandardOutput=append:/home/liuguoxing/Documents/motion_tracking/outputs/gp02_stage1_service.log
+StandardError=append:/home/liuguoxing/Documents/motion_tracking/outputs/gp02_stage1_service.log
+Restart=on-failure
+RestartSec=60
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target

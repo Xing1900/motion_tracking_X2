@@ -31,6 +31,13 @@ uv sync
 
 ## Motion Dataset Preparation
 
+GP02 V3 的资产、数据质量过滤、任务配置与训练说明见
+[GP02_FRAMEWORK_GUIDE_CN.md](GP02_FRAMEWORK_GUIDE_CN.md)。训练前可运行：
+
+```bash
+.venv/bin/python scripts/validate_gp02_setup.py --full-data-scan
+```
+
 <details>
 <summary><b>Quick Start: Download Preprocessed Dataset (Google Drive)</b></summary>
 
