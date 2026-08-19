@@ -9,7 +9,7 @@ PICO/XRoboToolkit -> GMR teleop bridge -> rl_tracking
                          v
                  x2_vr_recorder.py
                     ^             ^
-       camera TCP tap |             | ROS 2 joints/IMU
+       camera TCP tap |             | ROS 2 joints/IMU/hand status
                     X2 vision bridge
 ```
 
@@ -36,6 +36,10 @@ wall and monotonic receive timestamps.
 - `reference`: the interpolated frame actually sent by the Python bridge to
   C++ (before C++ yaw/position anchoring and transition blending).
 - `controller`: 50 Hz normalized PICO button state.
+- `hand_command`: authoritative mapped command status from
+  `/vr_hand_controller/status`: `active` plus independent left/right grasp
+  fractions in `[0, 1]`. This records the high-level command actually accepted
+  by the hand controller, not all OmniHand joint targets.
 - `camera_head`: original compressed X2 head-camera frame, normally received
   from the robot-side vision bridge TCP tap on port 28706.
 - `joint_states`: normalized leg/waist/arm/head state.  Real X2 recording reads
@@ -88,6 +92,7 @@ export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 
 ros2 topic echo /aima/hal/joint/leg/state --once
 ros2 topic echo /aima/hal/imu/torso/state --once
+ros2 topic echo /vr_hand_controller/status --once
 ```
 
 The AimDK camera publisher is bound to a robot-internal Fast DDS interface, so
@@ -139,9 +144,13 @@ available and defaults to sensor-style `best_effort` QoS.  If
 `--camera_qos_reliability reliable`.
 
 Before the first right-button press, wait for non-zero `controller`,
-`camera_head`, `joint_states`, and `imu_torso` counts.  `reference` normally
-starts growing only after the right button enables VR and C++ begins requesting
-frames; do not wait for it beforehand.
+`hand_command`, `camera_head`, `joint_states`, and `imu_torso` counts.
+`reference` normally starts growing only after the right button enables VR and
+C++ begins requesting frames; do not wait for it beforehand. New recordings
+require `hand_command`; if the status topic is missing, the episode is retained
+but marked invalid instead of silently losing the gripper action. At least two
+`hand_command` events inside the A-to-X active window must also have
+`active=true`; merely receiving inactive status heartbeats is not enough.
 
 - Right `key_one`: start a new episode.
 - Left `key_one`: stop, capture the configured post-roll, flush, and save.
@@ -150,7 +159,10 @@ frames; do not wait for it beforehand.
 If any required stream was absent, raw data is still preserved but the
 manifest is marked `status: invalid`, so it cannot silently enter conversion.
 Validation also checks all 29 leg/waist/arm joints, required split joint topics,
-minimum active-window frame counts, and long stream gaps.
+minimum active-window frame counts, long stream gaps, and configurable matching
+event predicates. A failed predicate is listed by name in
+`validation.failed_matching_event_requirements` (for hand control the name is
+`hand_command_active`) and is printed when the episode is finalized.
 
 Make the first trial only 5--10 seconds.  While it runs, confirm `reference`
 starts increasing and `queue` remains far below its limit with no drops; after
@@ -171,6 +183,7 @@ it is atomically renamed:
     ├── streams/
     │   ├── camera_head.jsonl
     │   ├── controller.jsonl
+    │   ├── hand_command.jsonl
     │   ├── imu_torso.jsonl
     │   ├── joint_states.jsonl
     │   ├── reference.jsonl
@@ -230,7 +243,8 @@ produces:
 
 - `observation.images.head`: RGB video;
 - `observation.state`: q29, dq29 and torso IMU (68 floats);
-- `action`: bridge reference `root xyz + quaternion wxyz + q29` (36 floats);
+- `action`: bridge reference `root xyz + quaternion wxyz + q29`, followed by
+  left and right grasp fractions (38 floats total);
 - one language task string per episode.
 
 When a synchronized tick is missing, the converter splits at that gap instead
@@ -246,6 +260,22 @@ aligned/consumed reference or `/joint_cmd/*` streams.
 
 The raw data remains the source of truth, so alternative local/delta action
 representations can be generated later without repeating a demonstration.
+
+Hand commands use causal zero-order-hold synchronization: a dataset tick uses
+only the newest status at or before that tick, never a closer future status.
+For authoritative status, adjacent uint32 `sequence` values are also checked.
+If events were lost, ticks strictly between the two surviving event timestamps
+are rejected as `hand_command_sequence_gap` instead of silently holding an old
+grasp value; each surviving event remains valid at its own timestamp (including
+normal uint32 wraparound).
+The default maximum age is 100 ms (`--max_hand_command_age_ms`). Inactive,
+invalid, missing or stale status ticks are dropped and therefore split
+continuous output segments. For old raw episodes without `hand_command`, the
+converter emits an explicit warning and derives both values from the legacy
+`controller` grip fields using the live mapping
+`clip((grip - 0.10) / (0.90 - 0.10), 0, 1)`. This fallback represents operator
+intent, not proof that the C++ hand node was armed, so authoritative new
+recordings should be preferred.
 
 Synchronization uses the recorder laptop's monotonic receive clock; device,
 ROS, bridge and camera-tap timestamps remain in the raw files for latency

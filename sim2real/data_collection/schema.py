@@ -73,7 +73,7 @@ XR_BODY_JOINT_NAMES = [
     "Right_Hand",
 ]
 
-ACTION_NAMES = [
+REFERENCE_ACTION_NAMES = [
     "reference.root_pos.x",
     "reference.root_pos.y",
     "reference.root_pos.z",
@@ -83,6 +83,13 @@ ACTION_NAMES = [
     "reference.root_quat.z",
     *[f"reference.{name}" for name in X2_TRACKING_JOINT_NAMES],
 ]
+
+HAND_ACTION_NAMES = [
+    "hand.left_grasp_fraction",
+    "hand.right_grasp_fraction",
+]
+
+ACTION_NAMES = [*REFERENCE_ACTION_NAMES, *HAND_ACTION_NAMES]
 
 OBSERVATION_STATE_NAMES = [
     *[f"joint_position.{name}" for name in X2_TRACKING_JOINT_NAMES],
@@ -102,11 +109,14 @@ OBSERVATION_STATE_NAMES = [
 TIMING_NAMES = [
     "camera_nearest_age_ms",
     "reference_nearest_age_ms",
+    "hand_command_previous_age_ms",
     "joint_max_age_ms",
     "imu_age_ms",
 ]
 
 
 assert len(X2_TRACKING_JOINT_NAMES) == 29
-assert len(ACTION_NAMES) == 36
+assert len(REFERENCE_ACTION_NAMES) == 36
+assert len(HAND_ACTION_NAMES) == 2
+assert len(ACTION_NAMES) == 38
 assert len(OBSERVATION_STATE_NAMES) == 68

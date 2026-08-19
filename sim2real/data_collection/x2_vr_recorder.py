@@ -34,6 +34,7 @@ except ImportError:  # Direct execution from this directory.
 
 
 DEFAULT_CAMERA_TOPIC = "/aima/hal/sensor/rgbd_head_front/rgb_image/compressed"
+DEFAULT_HAND_STATUS_TOPIC = "/vr_hand_controller/status"
 DEFAULT_AIMDK_JOINT_TOPICS = [
     "/aima/hal/joint/leg/state",
     "/aima/hal/joint/waist/state",
@@ -215,6 +216,19 @@ def _joint_state_payload(message: Any) -> Dict[str, Any]:
     }
 
 
+def _hand_status_payload(message: Any) -> Dict[str, Any]:
+    """Normalize the authoritative high-level hand command status."""
+
+    return {
+        "sequence": int(message.sequence),
+        "active": bool(message.active),
+        "mode": int(message.mode),
+        "left_grasp": float(message.left_grasp),
+        "right_grasp": float(message.right_grasp),
+        "source_message_type": "x1_protocol/msg/VrHandControlStatus",
+    }
+
+
 def _imu_stream_name(topic: str, index: int) -> str:
     topic_lower = str(topic).lower()
     if "torso" in topic_lower:
@@ -264,6 +278,19 @@ def _build_ros_node(ingress: IngressQueue, args: argparse.Namespace) -> Any:
             ) from exc
         joint_message_type = JointStateArray
 
+    hand_status_message_type: Any = None
+    if args.hand_status_topic:
+        try:
+            from x1_protocol.msg import VrHandControlStatus
+        except ImportError as exc:
+            raise ImportError(
+                "x1_protocol/VrHandControlStatus is unavailable. Source the built "
+                "x1_digit_mc/install/setup.bash after /opt/ros/humble/setup.bash, "
+                "or pass --hand_status_topic '' only for legacy recordings that "
+                "do not need authoritative hand actions."
+            ) from exc
+        hand_status_message_type = VrHandControlStatus
+
     class X2SensorRecorderNode(Node):
         def __init__(self) -> None:
             super().__init__("x2_vr_data_recorder")
@@ -284,6 +311,12 @@ def _build_ros_node(ingress: IngressQueue, args: argparse.Namespace) -> Any:
                 reliability=reliability,
                 durability=QoSDurabilityPolicy.VOLATILE,
             )
+            hand_status_qos = QoSProfile(
+                history=QoSHistoryPolicy.KEEP_LAST,
+                depth=10,
+                reliability=QoSReliabilityPolicy.RELIABLE,
+                durability=QoSDurabilityPolicy.VOLATILE,
+            )
 
             if args.camera_topic and not args.camera_tap_addr:
                 self._owned_subscriptions.append(
@@ -292,6 +325,17 @@ def _build_ros_node(ingress: IngressQueue, args: argparse.Namespace) -> Any:
                         args.camera_topic,
                         self._on_camera,
                         camera_qos,
+                        callback_group=self._callback_group,
+                    )
+                )
+
+            if args.hand_status_topic:
+                self._owned_subscriptions.append(
+                    self.create_subscription(
+                        hand_status_message_type,
+                        args.hand_status_topic,
+                        self._on_hand_status,
+                        hand_status_qos,
                         callback_group=self._callback_group,
                     )
                 )
@@ -330,7 +374,8 @@ def _build_ros_node(ingress: IngressQueue, args: argparse.Namespace) -> Any:
             )
             self.get_logger().info(
                 f"camera={camera_source}, joint_topics={args.joint_topics}, "
-                f"imu_topics={args.imu_topics}"
+                f"imu_topics={args.imu_topics}, "
+                f"hand_status={args.hand_status_topic or '<disabled>'}"
             )
 
         def _base_event(self, stream: str, source_stamp_ns: int, frame_id: str) -> Dict[str, Any]:
@@ -361,6 +406,15 @@ def _build_ros_node(ingress: IngressQueue, args: argparse.Namespace) -> Any:
                 "joint_states", ros_stamp_to_ns(message.header.stamp), message.header.frame_id
             )
             event.update({"topic": topic, **_joint_state_payload(message)})
+            ingress.put(event)
+
+        def _on_hand_status(self, message: Any) -> None:
+            event = self._base_event(
+                "hand_command",
+                ros_stamp_to_ns(message.header.stamp),
+                message.header.frame_id,
+            )
+            event.update({"topic": args.hand_status_topic, **_hand_status_payload(message)})
             ingress.put(event)
 
         def _on_imu(self, topic: str, stream: str, message: Any) -> None:
@@ -431,6 +485,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--camera_topic", default=DEFAULT_CAMERA_TOPIC)
     parser.add_argument(
+        "--hand_status_topic",
+        default=DEFAULT_HAND_STATUS_TOPIC,
+        help=(
+            "Authoritative mapped hand-command status topic. Pass an empty string "
+            "only for legacy/reference-only recording without hand actions."
+        ),
+    )
+    parser.add_argument(
         "--camera_tap_addr",
         default="",
         help=(
@@ -495,6 +557,7 @@ def main() -> None:
     required_streams = ["controller", "reference"]
     minimum_stream_counts = {"controller": 2, "reference": 2}
     max_stream_gap_s = {"controller": 1.0, "reference": 0.5}
+    minimum_matching_event_counts = []
     if camera_enabled:
         required_streams.append("camera_head")
         minimum_stream_counts["camera_head"] = 2
@@ -503,6 +566,19 @@ def main() -> None:
         required_streams.extend(["joint_states", "imu_torso"])
         minimum_stream_counts.update({"joint_states": 3, "imu_torso": 2})
         max_stream_gap_s["imu_torso"] = 0.5
+        if args.hand_status_topic:
+            required_streams.append("hand_command")
+            minimum_stream_counts["hand_command"] = 2
+            max_stream_gap_s["hand_command"] = 0.5
+            minimum_matching_event_counts.append(
+                {
+                    "name": "hand_command_active",
+                    "stream": "hand_command",
+                    "field": "active",
+                    "equals": True,
+                    "minimum_count": 2,
+                }
+            )
     source_config = {
         "hostname": socket.gethostname(),
         "tap_addr": args.tap_addr,
@@ -516,6 +592,14 @@ def main() -> None:
             else ("ros" if camera_enabled else "disabled")
         ),
         "camera_qos_reliability": args.camera_qos_reliability,
+        "hand_status_topic": (
+            None if args.disable_ros or not args.hand_status_topic else args.hand_status_topic
+        ),
+        "hand_status_message_type": (
+            None
+            if args.disable_ros or not args.hand_status_topic
+            else "x1_protocol/msg/VrHandControlStatus"
+        ),
         "sensor_profile": args.sensor_profile,
         "joint_message_type": SENSOR_PROFILES[args.sensor_profile]["joint_message_type"],
         "joint_topics": [] if args.disable_ros else list(args.joint_topics),
@@ -524,6 +608,7 @@ def main() -> None:
         "ros_localhost_only": os.environ.get("ROS_LOCALHOST_ONLY", "0"),
         "required_streams": required_streams,
         "minimum_stream_counts": minimum_stream_counts,
+        "minimum_matching_event_counts": minimum_matching_event_counts,
         "max_stream_gap_s": max_stream_gap_s,
         "required_joint_names": [] if args.disable_ros else list(X2_TRACKING_JOINT_NAMES),
         "required_joint_topics": (

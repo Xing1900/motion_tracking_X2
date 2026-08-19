@@ -13,6 +13,7 @@ import bisect
 import json
 import math
 import uuid
+import warnings
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,6 +27,7 @@ try:
         ACTION_NAMES,
         OBSERVATION_STATE_NAMES,
         RAW_DATASET_SCHEMA_VERSION,
+        REFERENCE_ACTION_NAMES,
         X2_TRACKING_JOINT_NAMES,
     )
 except ImportError:  # Direct execution from this directory.
@@ -34,6 +36,7 @@ except ImportError:  # Direct execution from this directory.
         ACTION_NAMES,
         OBSERVATION_STATE_NAMES,
         RAW_DATASET_SCHEMA_VERSION,
+        REFERENCE_ACTION_NAMES,
         X2_TRACKING_JOINT_NAMES,
     )
 
@@ -120,7 +123,9 @@ class ReferenceSeries:
             if isinstance(frames, list):
                 for frame_index, frame in enumerate(frames):
                     vector = np.asarray(frame, dtype=np.float64).reshape(-1)
-                    if vector.shape == (36,) and np.all(np.isfinite(vector)):
+                    if vector.shape == (len(REFERENCE_ACTION_NAMES),) and np.all(
+                        np.isfinite(vector)
+                    ):
                         samples.append(
                             (
                                 base_time_ns + frame_index * frame_dt_ns,
@@ -134,7 +139,9 @@ class ReferenceSeries:
             frame = event.get("qpos_root_xyz_quat_wxyz_dof")
             if frame is not None:
                 vector = np.asarray(frame, dtype=np.float64).reshape(-1)
-                if vector.shape == (36,) and np.all(np.isfinite(vector)):
+                if vector.shape == (len(REFERENCE_ACTION_NAMES),) and np.all(
+                    np.isfinite(vector)
+                ):
                     samples.append((base_time_ns, vector, retarget_age_ms))
 
         samples.sort(key=lambda item: item[0])
@@ -283,6 +290,146 @@ class PreviousEventSeries:
         return self.events[index], (target_ns - self.times[index]) / 1e6
 
 
+class HandCommandSeries:
+    """Causally sample authoritative or legacy high-level hand actions.
+
+    Hand commands are zero-order-held: a target tick may use only the most
+    recent event at or before that tick.  Nearest-neighbour sampling would let
+    a future grip transition leak into an earlier camera/robot observation.
+    """
+
+    LEGACY_GRIP_DEADZONE = 0.10
+    LEGACY_GRIP_FULL_SCALE = 0.90
+    UINT32_MODULUS = 1 << 32
+
+    def __init__(self, events: Iterable[Dict[str, Any]], *, legacy_controller: bool) -> None:
+        self.series = PreviousEventSeries(events)
+        self.legacy_controller = bool(legacy_controller)
+
+    @staticmethod
+    def _unit_pair(left: Any, right: Any) -> Optional[np.ndarray]:
+        try:
+            values = np.asarray([float(left), float(right)], dtype=np.float64)
+        except (TypeError, ValueError):
+            return None
+        if values.shape != (2,) or not np.all(np.isfinite(values)):
+            return None
+        if np.any(values < 0.0) or np.any(values > 1.0):
+            return None
+        return values
+
+    @classmethod
+    def _normalize_legacy_grips(cls, values: np.ndarray) -> np.ndarray:
+        return np.clip(
+            (values - cls.LEGACY_GRIP_DEADZONE)
+            / (cls.LEGACY_GRIP_FULL_SCALE - cls.LEGACY_GRIP_DEADZONE),
+            0.0,
+            1.0,
+        )
+
+    @classmethod
+    def _uint32_sequence(cls, value: Any) -> Optional[int]:
+        if isinstance(value, bool):
+            return None
+        try:
+            sequence = int(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if sequence < 0 or sequence >= cls.UINT32_MODULUS:
+            return None
+        if isinstance(value, float) and not value.is_integer():
+            return None
+        return sequence
+
+    def _authoritative_sequence_status(self, index: int, target_ns: int) -> str:
+        current_sequence = self._uint32_sequence(
+            self.series.events[index].get("sequence")
+        )
+        if current_sequence is None:
+            return "invalid"
+
+        next_index = index + 1
+        if next_index >= len(self.series.events):
+            return "ok"
+        current_time_ns = self.series.times[index]
+        next_time_ns = self.series.times[next_index]
+        if not current_time_ns < target_ns < next_time_ns:
+            # A published event is authoritative at its own timestamp, even
+            # when one or more status events were lost before the next event.
+            return "ok"
+
+        next_sequence = self._uint32_sequence(
+            self.series.events[next_index].get("sequence")
+        )
+        if next_sequence is None:
+            return "invalid"
+        sequence_delta = (
+            next_sequence - current_sequence
+        ) % self.UINT32_MODULUS
+        return "sequence_gap" if sequence_delta > 1 else "ok"
+
+    def sample(self, target_ns: int) -> tuple[Optional[np.ndarray], float, str]:
+        index = _previous_index(self.series.times, target_ns)
+        if index is None:
+            return None, math.inf, "missing"
+        event = self.series.events[index]
+        event_age_ms = (target_ns - self.series.times[index]) / 1e6
+
+        if not self.legacy_controller:
+            sequence_status = self._authoritative_sequence_status(index, target_ns)
+            if sequence_status != "ok":
+                return None, event_age_ms, sequence_status
+            active = event.get("active")
+            if active is False:
+                return None, event_age_ms, "inactive"
+            if active is not True:
+                return None, event_age_ms, "invalid"
+            values = self._unit_pair(event.get("left_grasp"), event.get("right_grasp"))
+            if values is None:
+                return None, event_age_ms, "invalid"
+            return values, event_age_ms, "ok"
+
+        buttons = event.get("controller_buttons")
+        if not isinstance(buttons, dict):
+            return None, event_age_ms, "invalid"
+        values = self._unit_pair(
+            buttons.get("left_grip_value"), buttons.get("right_grip_value")
+        )
+        if values is None:
+            return None, event_age_ms, "invalid"
+
+        # Legacy controller events predate the authoritative hand status.  When
+        # available, include the XR-source age carried by the bridge instead of
+        # treating a newly re-published frozen controller value as fresh.
+        raw_source_age_ms = event.get("controller_age_ms")
+        if raw_source_age_ms is not None:
+            try:
+                source_age_ms = float(raw_source_age_ms)
+            except (TypeError, ValueError):
+                return None, math.inf, "invalid"
+            if not math.isfinite(source_age_ms) or source_age_ms < 0.0:
+                return None, math.inf, "invalid"
+            event_age_ms += source_age_ms
+
+        return self._normalize_legacy_grips(values), event_age_ms, "ok"
+
+
+def _load_hand_command_series(episode_dir: Path) -> HandCommandSeries:
+    hand_command_events = _load_stream(episode_dir, "hand_command")
+    if hand_command_events:
+        return HandCommandSeries(hand_command_events, legacy_controller=False)
+
+    controller_events = _load_stream(episode_dir, "controller")
+    warnings.warn(
+        f"{episode_dir}: authoritative hand_command stream is missing; "
+        "deriving left/right grasp actions from legacy controller grip values "
+        "with deadzone=0.10 and full_scale=0.90",
+        RuntimeWarning,
+        stacklevel=2,
+    )
+    return HandCommandSeries(controller_events, legacy_controller=True)
+
+
 def _decode_rgb(image_path: Path, *, rotation_deg: int = 0) -> np.ndarray:
     try:
         import cv2
@@ -367,6 +514,7 @@ def build_episode_samples(
     max_reference_age_ms: float,
     max_reference_gap_ms: float,
     max_retarget_age_ms: float,
+    max_hand_command_age_ms: float,
     max_joint_age_ms: float,
     max_imu_age_ms: float,
 ) -> EpisodeSamples:
@@ -385,6 +533,7 @@ def build_episode_samples(
     if not reference_events:
         reference_events = _load_stream(episode_dir, "retarget")
     references = ReferenceSeries(reference_events)
+    hand_commands = _load_hand_command_series(episode_dir)
     joints = JointStateSeries(_load_stream(episode_dir, "joint_states"))
     imu = PreviousEventSeries(_load_stream(episode_dir, "imu_torso"))
     camera_events = _load_stream(episode_dir, "camera_head")
@@ -406,10 +555,10 @@ def build_episode_samples(
             skip_counts["camera_stale"] += 1
             continue
 
-        action, reference_age_ms, retarget_age_ms, reference_gap_ms = references.interpolate(
-            target_ns
+        reference_action, reference_age_ms, retarget_age_ms, reference_gap_ms = (
+            references.interpolate(target_ns)
         )
-        if action is None:
+        if reference_action is None:
             skip_counts["reference_missing"] += 1
             continue
         if reference_age_ms > max_reference_age_ms:
@@ -420,6 +569,14 @@ def build_episode_samples(
             continue
         if not math.isfinite(retarget_age_ms) or retarget_age_ms > max_retarget_age_ms:
             skip_counts["retarget_stale"] += 1
+            continue
+
+        hand_action, hand_command_age_ms, hand_status = hand_commands.sample(target_ns)
+        if hand_action is None:
+            skip_counts[f"hand_command_{hand_status}"] += 1
+            continue
+        if hand_command_age_ms > max_hand_command_age_ms:
+            skip_counts["hand_command_stale"] += 1
             continue
 
         q, dq, joint_age_ms, missing_joints = joints.sample(target_ns)
@@ -471,8 +628,8 @@ def build_episode_samples(
         state = np.concatenate([q, dq, orientation, angular_velocity, linear_acceleration]).astype(
             np.float32
         )
-        action = np.asarray(action, dtype=np.float32)
-        if state.shape != (68,) or action.shape != (36,):
+        action = np.concatenate([reference_action, hand_action]).astype(np.float32)
+        if state.shape != (68,) or action.shape != (len(ACTION_NAMES),):
             skip_counts["shape_invalid"] += 1
             continue
         if not np.all(np.isfinite(state)) or not np.all(np.isfinite(action)):
@@ -495,7 +652,13 @@ def build_episode_samples(
                 state=state,
                 action=action,
                 timing_ms=np.asarray(
-                    [camera_age_ms, reference_age_ms, joint_age_ms, imu_age_ms],
+                    [
+                        camera_age_ms,
+                        reference_age_ms,
+                        hand_command_age_ms,
+                        joint_age_ms,
+                        imu_age_ms,
+                    ],
                     dtype=np.float32,
                 ),
             )
@@ -576,6 +739,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_reference_age_ms", type=float, default=60.0)
     parser.add_argument("--max_reference_gap_ms", type=float, default=120.0)
     parser.add_argument("--max_retarget_age_ms", type=float, default=100.0)
+    parser.add_argument("--max_hand_command_age_ms", type=float, default=100.0)
     parser.add_argument("--max_joint_age_ms", type=float, default=100.0)
     parser.add_argument("--max_imu_age_ms", type=float, default=100.0)
     parser.add_argument(
@@ -602,6 +766,8 @@ def main() -> None:
         raise ValueError("--fps must be positive")
     if args.min_segment_frames <= 0:
         raise ValueError("--min_segment_frames must be positive")
+    if args.max_hand_command_age_ms <= 0.0:
+        raise ValueError("--max_hand_command_age_ms must be positive")
 
     raw_root = Path(args.raw_root).expanduser().resolve()
     if not raw_root.is_dir():
@@ -621,6 +787,7 @@ def main() -> None:
             max_reference_age_ms=args.max_reference_age_ms,
             max_reference_gap_ms=args.max_reference_gap_ms,
             max_retarget_age_ms=args.max_retarget_age_ms,
+            max_hand_command_age_ms=args.max_hand_command_age_ms,
             max_joint_age_ms=args.max_joint_age_ms,
             max_imu_age_ms=args.max_imu_age_ms,
         )

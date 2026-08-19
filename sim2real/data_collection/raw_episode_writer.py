@@ -100,6 +100,10 @@ class RawEpisodeWriter:
         self._active_stream_stats: Dict[str, Dict[str, int]] = {}
         self._active_joint_names: set[str] = set()
         self._active_joint_topic_stats: Dict[str, Dict[str, int]] = {}
+        self._matching_event_requirements = self._normalize_matching_event_requirements(
+            source_config.get("minimum_matching_event_counts", [])
+        )
+        self._active_matching_event_counts: Counter[str] = Counter()
         self._manifest: Dict[str, Any] = {
             "schema_version": RAW_DATASET_SCHEMA_VERSION,
             "robot_type": "agibot_x2",
@@ -121,6 +125,61 @@ class RawEpisodeWriter:
             "ingress_drops": {},
         }
         _write_json(self.partial_dir / "manifest.json", self._manifest)
+
+    @staticmethod
+    def _normalize_matching_event_requirements(
+        raw_requirements: Any,
+    ) -> list[Dict[str, Any]]:
+        if not isinstance(raw_requirements, list):
+            raise ValueError("minimum_matching_event_counts must be a list")
+        requirements: list[Dict[str, Any]] = []
+        names: set[str] = set()
+        for index, raw_requirement in enumerate(raw_requirements):
+            if not isinstance(raw_requirement, dict):
+                raise ValueError(
+                    f"minimum_matching_event_counts[{index}] must be an object"
+                )
+            stream = str(raw_requirement.get("stream", "")).strip()
+            field = str(raw_requirement.get("field", "")).strip()
+            if not stream or not field or "equals" not in raw_requirement:
+                raise ValueError(
+                    "matching-event requirements need stream, field, and equals"
+                )
+            minimum_count = int(raw_requirement.get("minimum_count", 1))
+            if minimum_count < 1:
+                raise ValueError("matching-event minimum_count must be positive")
+            name = str(
+                raw_requirement.get("name") or f"{stream}.{field}.equals"
+            ).strip()
+            if not name or name in names:
+                raise ValueError(f"duplicate or empty matching-event requirement: {name!r}")
+            names.add(name)
+            requirements.append(
+                {
+                    "name": name,
+                    "stream": stream,
+                    "field": field,
+                    "equals": raw_requirement["equals"],
+                    "minimum_count": minimum_count,
+                }
+            )
+        return requirements
+
+    @staticmethod
+    def _event_field(event: Dict[str, Any], field: str) -> tuple[bool, Any]:
+        value: Any = event
+        for component in field.split("."):
+            if not isinstance(value, dict) or component not in value:
+                return False, None
+            value = value[component]
+        return True, value
+
+    @staticmethod
+    def _field_value_matches(actual: Any, expected: Any) -> bool:
+        # Python considers True == 1; validation predicates should not.
+        if isinstance(expected, bool):
+            return actual is expected
+        return actual == expected
 
     def _stream_handle(self, stream: str) -> Any:
         safe_stream = re.sub(r"[^a-zA-Z0-9_.-]+", "_", stream)
@@ -159,6 +218,12 @@ class RawEpisodeWriter:
         if timestamp_ns < self._start_monotonic_ns or self._validation_stop_ns is not None:
             return
         self._update_timing_stats(self._active_stream_stats, stream, timestamp_ns)
+        for requirement in self._matching_event_requirements:
+            if requirement["stream"] != stream:
+                continue
+            field_found, actual = self._event_field(event, requirement["field"])
+            if field_found and self._field_value_matches(actual, requirement["equals"]):
+                self._active_matching_event_counts[requirement["name"]] += 1
         if stream != "joint_states":
             return
 
@@ -311,6 +376,23 @@ class RawEpisodeWriter:
                 if max_gap_ns > int(joint_topic_max_gap_s * 1e9):
                     stale_joint_topics.append(topic)
 
+        matching_event_requirements = []
+        failed_matching_event_requirements: list[str] = []
+        for requirement in self._matching_event_requirements:
+            actual_count = int(
+                self._active_matching_event_counts.get(requirement["name"], 0)
+            )
+            passed = actual_count >= requirement["minimum_count"]
+            matching_event_requirements.append(
+                {
+                    **requirement,
+                    "actual_count": actual_count,
+                    "passed": passed,
+                }
+            )
+            if not passed:
+                failed_matching_event_requirements.append(requirement["name"])
+
         validation_valid = not any(
             (
                 missing_streams,
@@ -318,6 +400,7 @@ class RawEpisodeWriter:
                 missing_joint_names,
                 missing_joint_topics,
                 stale_joint_topics,
+                failed_matching_event_requirements,
             )
         )
         self._manifest["validation"] = {
@@ -333,6 +416,8 @@ class RawEpisodeWriter:
             "missing_joint_topics": missing_joint_topics,
             "joint_topic_max_gaps_s": joint_topic_gaps_s,
             "stale_joint_topics": sorted(stale_joint_topics),
+            "matching_event_requirements": matching_event_requirements,
+            "failed_matching_event_requirements": failed_matching_event_requirements,
             "valid": validation_valid,
         }
         if status == "complete" and not validation_valid:
@@ -480,7 +565,9 @@ class RawEpisodeManager:
                 f"stale_streams={manifest_validation.get('stale_streams', [])}, "
                 f"missing_joint_names={manifest_validation.get('missing_joint_names', [])}, "
                 f"missing_joint_topics={manifest_validation.get('missing_joint_topics', [])}, "
-                f"stale_joint_topics={manifest_validation.get('stale_joint_topics', [])}"
+                f"stale_joint_topics={manifest_validation.get('stale_joint_topics', [])}, "
+                "failed_matching_event_requirements="
+                f"{manifest_validation.get('failed_matching_event_requirements', [])}"
             )
         self._writer = None
         self._stop_trigger_ns = None
