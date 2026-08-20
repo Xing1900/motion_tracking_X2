@@ -107,8 +107,8 @@ OBSERVATION_STATE_NAMES = [
 ]
 
 TIMING_NAMES = [
-    "camera_nearest_age_ms",
-    "reference_nearest_age_ms",
+    "camera_grid_offset_signed_ms",
+    "reference_previous_age_ms",
     "hand_command_previous_age_ms",
     "joint_max_age_ms",
     "imu_age_ms",
@@ -120,3 +120,4 @@ assert len(REFERENCE_ACTION_NAMES) == 36
 assert len(HAND_ACTION_NAMES) == 2
 assert len(ACTION_NAMES) == 38
 assert len(OBSERVATION_STATE_NAMES) == 68
+assert len(TIMING_NAMES) == 5

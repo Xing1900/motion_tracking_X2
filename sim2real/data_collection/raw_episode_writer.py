@@ -290,6 +290,7 @@ class RawEpisodeWriter:
         stop_trigger_monotonic_ns: Optional[int],
         success: Optional[bool],
         ingress_drops: Dict[str, int],
+        abort_requested: Optional[Callable[[], bool]] = None,
     ) -> Path:
         if self._closed:
             return self.final_dir
@@ -299,6 +300,10 @@ class RawEpisodeWriter:
             os.fsync(handle.fileno())
             handle.close()
         self._handles.clear()
+
+        if abort_requested is not None and abort_requested():
+            status = "interrupted"
+            success = None
 
         self._manifest["status"] = str(status)
         self._manifest["success"] = success
@@ -429,6 +434,19 @@ class RawEpisodeWriter:
         self._manifest["recording"]["finalized_wall_time_ns"] = time.time_ns()
         _write_json(self.partial_dir / "manifest.json", self._manifest)
 
+        # The manifest write itself performs fsync and can block long enough
+        # for the dispatcher watchdog to request abort. Re-check immediately
+        # before exposing the directory; if needed, atomically rewrite the
+        # manifest as interrupted first.
+        if (
+            abort_requested is not None
+            and abort_requested()
+            and self._manifest["status"] != "interrupted"
+        ):
+            self._manifest["status"] = "interrupted"
+            self._manifest["success"] = None
+            _write_json(self.partial_dir / "manifest.json", self._manifest)
+
         self.partial_dir.replace(self.final_dir)
         self._closed = True
         return self.final_dir
@@ -467,6 +485,9 @@ class RawEpisodeManager:
         self._finalize_deadline_ns: Optional[int] = None
         self._drop_baseline: Dict[str, int] = {}
         self._lock = threading.Lock()
+        # A supervisor must be able to latch failure even while the writer
+        # thread is blocked in disk I/O under _lock.
+        self._abort_requested = threading.Event()
 
     @property
     def state(self) -> str:
@@ -536,6 +557,9 @@ class RawEpisodeManager:
     def _finish_episode(self, status: str, success: Optional[bool]) -> Optional[Path]:
         if self._writer is None:
             return None
+        if self._abort_requested.is_set():
+            status = "interrupted"
+            success = None
         current_drops = self.drop_counts()
         episode_drops = {
             stream: max(0, int(count) - int(self._drop_baseline.get(stream, 0)))
@@ -547,6 +571,7 @@ class RawEpisodeManager:
             stop_trigger_monotonic_ns=self._stop_trigger_ns,
             success=success,
             ingress_drops=episode_drops,
+            abort_requested=self._abort_requested.is_set,
         )
         manifest_status = status
         manifest_validation: Dict[str, Any] = {}
@@ -621,6 +646,24 @@ class RawEpisodeManager:
         with self._lock:
             status = "complete" if self._stop_trigger_ns is not None else "interrupted"
             return self._finish_episode(status=status, success=None)
+
+    def request_abort(self) -> None:
+        """Latch interrupted status without waiting for the writer lock."""
+
+        self._abort_requested.set()
+
+    def abort(self) -> Optional[Path]:
+        """Finalize any active episode as interrupted after a writer failure.
+
+        A stop trigger alone must not promote an episode to ``complete`` once
+        the dispatcher has observed an I/O or serialization failure.  If the
+        final flush itself also fails, the hidden ``.partial`` directory is
+        intentionally left in place for manual recovery.
+        """
+
+        self.request_abort()
+        with self._lock:
+            return self._finish_episode(status="interrupted", success=None)
 
 
 def read_jsonl(path: Path) -> Iterable[Dict[str, Any]]:

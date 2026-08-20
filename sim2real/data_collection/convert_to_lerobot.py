@@ -28,7 +28,17 @@ try:
         OBSERVATION_STATE_NAMES,
         RAW_DATASET_SCHEMA_VERSION,
         REFERENCE_ACTION_NAMES,
+        TIMING_NAMES,
         X2_TRACKING_JOINT_NAMES,
+    )
+    from .synchronization import (
+        SYNC_TIME_KEY,
+        TIME_BASES,
+        TIME_BASIS_RECEIVER,
+        TIME_BASIS_SOURCE,
+        TimedStream,
+        synchronization_time_ns,
+        timed_stream,
     )
 except ImportError:  # Direct execution from this directory.
     from raw_episode_writer import event_monotonic_ns, read_jsonl
@@ -37,7 +47,17 @@ except ImportError:  # Direct execution from this directory.
         OBSERVATION_STATE_NAMES,
         RAW_DATASET_SCHEMA_VERSION,
         REFERENCE_ACTION_NAMES,
+        TIMING_NAMES,
         X2_TRACKING_JOINT_NAMES,
+    )
+    from synchronization import (
+        SYNC_TIME_KEY,
+        TIME_BASES,
+        TIME_BASIS_RECEIVER,
+        TIME_BASIS_SOURCE,
+        TimedStream,
+        synchronization_time_ns,
+        timed_stream,
     )
 
 
@@ -48,6 +68,7 @@ class ConvertedSample:
     state: np.ndarray
     action: np.ndarray
     timing_ms: np.ndarray
+    observation_timestamp_ns: Optional[int] = None
 
 
 @dataclass
@@ -57,6 +78,11 @@ class EpisodeSamples:
     samples: list[ConvertedSample]
     candidate_count: int
     skip_counts: Dict[str, int]
+    time_basis: str = TIME_BASIS_SOURCE
+    synchronization_diagnostics: Optional[Dict[str, Dict[str, Any]]] = None
+
+
+CONVERSION_REPORT_SCHEMA_VERSION = "x2-vr-lerobot-conversion-v1"
 
 
 def _load_manifest(episode_dir: Path) -> Dict[str, Any]:
@@ -69,6 +95,22 @@ def _load_stream(episode_dir: Path, stream: str) -> list[Dict[str, Any]]:
     events = list(read_jsonl(episode_dir / "streams" / f"{stream}.jsonl"))
     events.sort(key=event_monotonic_ns)
     return events
+
+
+def _load_timed_stream(
+    episode_dir: Path,
+    stream: str,
+    *,
+    time_basis: str,
+) -> TimedStream:
+    events = list(read_jsonl(episode_dir / "streams" / f"{stream}.jsonl"))
+    return timed_stream(events, stream, time_basis=time_basis)
+
+
+def _series_time_ns(event: Dict[str, Any]) -> int:
+    if SYNC_TIME_KEY in event:
+        return synchronization_time_ns(event)
+    return event_monotonic_ns(event)
 
 
 def _nearest_index(times: Sequence[int], target_ns: int) -> Optional[int]:
@@ -104,10 +146,15 @@ def _nlerp_quat_wxyz(q0: np.ndarray, q1: np.ndarray, alpha: float) -> np.ndarray
 
 
 class ReferenceSeries:
-    def __init__(self, events: Iterable[Dict[str, Any]]) -> None:
+    def __init__(
+        self,
+        events: Iterable[Dict[str, Any]],
+        *,
+        account_for_scheduled_frame_age: bool = True,
+    ) -> None:
         samples: list[tuple[int, np.ndarray, float]] = []
         for event in events:
-            base_time_ns = event_monotonic_ns(event)
+            base_time_ns = _series_time_ns(event)
             frame_dt_ns = int(event.get("frame_dt_ns", 20_000_000))
             raw_retarget_age = event.get("retarget_age_ms")
             if raw_retarget_age is None:
@@ -126,11 +173,20 @@ class ReferenceSeries:
                     if vector.shape == (len(REFERENCE_ACTION_NAMES),) and np.all(
                         np.isfinite(vector)
                     ):
+                        # A chunk is available in one reply but its later
+                        # frames are scheduled for later controller ticks.  By
+                        # then the GMR input used to construct the chunk is
+                        # older by the same frame offset.
+                        scheduled_retarget_age_ms = retarget_age_ms
+                        if account_for_scheduled_frame_age:
+                            scheduled_retarget_age_ms += (
+                                frame_index * frame_dt_ns / 1e6
+                            )
                         samples.append(
                             (
                                 base_time_ns + frame_index * frame_dt_ns,
                                 vector,
-                                retarget_age_ms,
+                                scheduled_retarget_age_ms,
                             )
                         )
                 continue
@@ -154,6 +210,33 @@ class ReferenceSeries:
         self.times = [item[0] for item in deduplicated]
         self.values = [item[1] for item in deduplicated]
         self.retarget_ages_ms = [item[2] for item in deduplicated]
+
+    def sample_previous(
+        self, target_ns: int
+    ) -> tuple[Optional[np.ndarray], float, float, float]:
+        """Return the command actually available at or before ``target_ns``.
+
+        Reference events are discrete commands sent toward C++.  Causal
+        previous-event sampling avoids inventing a command by interpolating
+        with a reply that did not yet exist at the camera exposure time.
+        """
+
+        index = _previous_index(self.times, target_ns)
+        if index is None:
+            return None, math.inf, math.inf, math.inf
+        command_age_ms = (target_ns - self.times[index]) / 1e6
+        next_index = index + 1
+        command_gap_ms = (
+            (self.times[next_index] - self.times[index]) / 1e6
+            if next_index < len(self.times)
+            else 0.0
+        )
+        return (
+            self.values[index].copy(),
+            command_age_ms,
+            self.retarget_ages_ms[index] + command_age_ms,
+            command_gap_ms,
+        )
 
     def interpolate(self, target_ns: int) -> tuple[Optional[np.ndarray], float, float, float]:
         if not self.times:
@@ -206,8 +289,8 @@ class ReferenceSeries:
 
 class JointStateSeries:
     def __init__(self, events: Iterable[Dict[str, Any]]) -> None:
-        self.events = sorted(events, key=event_monotonic_ns)
-        self.times = [event_monotonic_ns(event) for event in self.events]
+        self.events = sorted(events, key=_series_time_ns)
+        self.times = [_series_time_ns(event) for event in self.events]
         self._cursor = -1
         self._last_target_ns = -1
         self._positions: Dict[str, float] = {}
@@ -280,8 +363,8 @@ class JointStateSeries:
 
 class PreviousEventSeries:
     def __init__(self, events: Iterable[Dict[str, Any]]) -> None:
-        self.events = sorted(events, key=event_monotonic_ns)
-        self.times = [event_monotonic_ns(event) for event in self.events]
+        self.events = sorted(events, key=_series_time_ns)
+        self.times = [_series_time_ns(event) for event in self.events]
 
     def sample(self, target_ns: int) -> tuple[Optional[Dict[str, Any]], float]:
         index = _previous_index(self.times, target_ns)
@@ -414,12 +497,20 @@ class HandCommandSeries:
         return self._normalize_legacy_grips(values), event_age_ms, "ok"
 
 
-def _load_hand_command_series(episode_dir: Path) -> HandCommandSeries:
-    hand_command_events = _load_stream(episode_dir, "hand_command")
-    if hand_command_events:
-        return HandCommandSeries(hand_command_events, legacy_controller=False)
+def _load_hand_command_series(
+    episode_dir: Path,
+    *,
+    time_basis: str = TIME_BASIS_RECEIVER,
+) -> HandCommandSeries:
+    hand_command_stream = _load_timed_stream(
+        episode_dir, "hand_command", time_basis=time_basis
+    )
+    if hand_command_stream.input_count:
+        return HandCommandSeries(hand_command_stream.events, legacy_controller=False)
 
-    controller_events = _load_stream(episode_dir, "controller")
+    controller_events = _load_timed_stream(
+        episode_dir, "controller", time_basis=time_basis
+    ).events
     warnings.warn(
         f"{episode_dir}: authoritative hand_command stream is missing; "
         "deriving left/right grasp actions from legacy controller grip values "
@@ -480,7 +571,7 @@ def split_contiguous_samples(
 
 
 def _validate_segment_images(
-    segments: Sequence[tuple[str, Sequence[ConvertedSample]]],
+    segments: Sequence[tuple[EpisodeSamples, Sequence[ConvertedSample]]],
     *,
     camera_rotation_deg: int,
 ) -> tuple[int, int, int]:
@@ -506,6 +597,136 @@ def _validate_segment_images(
     return first_shape
 
 
+def _conversion_report_payload(
+    *,
+    raw_root: Path,
+    output_root: Path,
+    repo_id: str,
+    fps: int,
+    time_basis: str,
+    allow_partial_source_time: bool,
+    max_camera_age_ms: float,
+    max_reference_age_ms: float,
+    max_reference_gap_ms: float,
+    max_retarget_age_ms: float,
+    max_hand_command_age_ms: float,
+    max_joint_age_ms: float,
+    max_imu_age_ms: float,
+    camera_rotation_deg: int,
+    min_segment_frames: int,
+    require_success: bool,
+    converted: Sequence[EpisodeSamples],
+    output_segments: Sequence[tuple[EpisodeSamples, Sequence[ConvertedSample]]],
+    short_fragment_frames_dropped: int,
+) -> Dict[str, Any]:
+    """Build the immutable provenance report stored beside LeRobot output."""
+
+    segment_records: list[Dict[str, Any]] = []
+    segment_indices_by_episode: Dict[Path, list[int]] = {}
+    for dataset_episode_index, (episode, samples) in enumerate(output_segments):
+        if not samples:
+            raise ValueError("conversion report cannot describe an empty output segment")
+        first = samples[0]
+        last = samples[-1]
+        if first.observation_timestamp_ns is None or last.observation_timestamp_ns is None:
+            raise ValueError("output segment is missing camera synchronization timestamps")
+        segment_indices_by_episode.setdefault(episode.episode_dir, []).append(
+            dataset_episode_index
+        )
+        segment_records.append(
+            {
+                "dataset_episode_index": dataset_episode_index,
+                "raw_episode": episode.episode_dir.name,
+                "raw_episode_path": str(episode.episode_dir),
+                "task": episode.task,
+                "frame_count": len(samples),
+                "first_target_timestamp_ns": int(first.timestamp_ns),
+                "last_target_timestamp_ns": int(last.timestamp_ns),
+                "first_camera_timestamp_ns": int(first.observation_timestamp_ns),
+                "last_camera_timestamp_ns": int(last.observation_timestamp_ns),
+            }
+        )
+
+    episode_records: list[Dict[str, Any]] = []
+    for episode in converted:
+        output_segment_indices = segment_indices_by_episode.get(
+            episode.episode_dir, []
+        )
+        episode_records.append(
+            {
+                "raw_episode": episode.episode_dir.name,
+                "raw_episode_path": str(episode.episode_dir),
+                "task": episode.task,
+                "candidate_ticks": int(episode.candidate_count),
+                "accepted_ticks_before_segmentation": len(episode.samples),
+                "skip_counts": episode.skip_counts,
+                "synchronization_diagnostics": episode.synchronization_diagnostics,
+                "output_segment_indices": output_segment_indices,
+                "output_segment_frame_counts": [
+                    int(segment_records[index]["frame_count"])
+                    for index in output_segment_indices
+                ],
+            }
+        )
+
+    thresholds_ms = {
+        "camera": float(max_camera_age_ms),
+        "reference": float(max_reference_age_ms),
+        "reference_gap": float(max_reference_gap_ms),
+        "retarget": float(max_retarget_age_ms),
+        "hand_command": float(max_hand_command_age_ms),
+        "joint": float(max_joint_age_ms),
+        "imu": float(max_imu_age_ms),
+    }
+    return {
+        "schema_version": CONVERSION_REPORT_SCHEMA_VERSION,
+        "raw_dataset_schema_version": RAW_DATASET_SCHEMA_VERSION,
+        "raw_root": str(raw_root),
+        "output_root": str(output_root),
+        "repo_id": str(repo_id),
+        "time_basis": str(time_basis),
+        "fps": int(fps),
+        "conversion": {
+            "thresholds_ms": thresholds_ms,
+            "camera_rotation_deg": int(camera_rotation_deg),
+            "min_segment_frames": int(min_segment_frames),
+            "require_success": bool(require_success),
+            "allow_partial_source_time": bool(allow_partial_source_time),
+        },
+        "summary": {
+            "raw_episode_count": len(converted),
+            "candidate_ticks": sum(
+                int(episode.candidate_count) for episode in converted
+            ),
+            "accepted_ticks_before_segmentation": sum(
+                len(episode.samples) for episode in converted
+            ),
+            "output_segment_count": len(segment_records),
+            "output_frame_count": sum(
+                int(record["frame_count"]) for record in segment_records
+            ),
+            "short_fragment_frames_dropped": int(
+                short_fragment_frames_dropped
+            ),
+        },
+        "raw_episodes": episode_records,
+        "output_segments": segment_records,
+        "timestamp_note": (
+            "target and camera timestamps are integer nanoseconds in the "
+            "recorder-monotonic domain selected by time_basis; each output "
+            "segment is contiguous at 1/fps"
+        ),
+    }
+
+
+def _write_conversion_report(path: Path, payload: Dict[str, Any]) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2)
+        handle.write("\n")
+    temporary.replace(path)
+
+
 def build_episode_samples(
     episode_dir: Path,
     *,
@@ -517,7 +738,11 @@ def build_episode_samples(
     max_hand_command_age_ms: float,
     max_joint_age_ms: float,
     max_imu_age_ms: float,
+    time_basis: str = TIME_BASIS_SOURCE,
+    allow_partial_source_time: bool = False,
 ) -> EpisodeSamples:
+    if time_basis not in TIME_BASES:
+        raise ValueError(f"unsupported time basis: {time_basis!r}")
     manifest = _load_manifest(episode_dir)
     _validate_manifest(manifest, episode_dir)
     recording = manifest.get("recording", {})
@@ -529,20 +754,130 @@ def build_episode_samples(
     if stop_ns <= start_ns:
         raise ValueError(f"Episode stop is not after start: {episode_dir}")
 
-    reference_events = _load_stream(episode_dir, "reference")
-    if not reference_events:
-        reference_events = _load_stream(episode_dir, "retarget")
-    references = ReferenceSeries(reference_events)
-    hand_commands = _load_hand_command_series(episode_dir)
-    joints = JointStateSeries(_load_stream(episode_dir, "joint_states"))
-    imu = PreviousEventSeries(_load_stream(episode_dir, "imu_torso"))
-    camera_events = _load_stream(episode_dir, "camera_head")
-    camera_times = [event_monotonic_ns(event) for event in camera_events]
+    timed_streams: Dict[str, TimedStream] = {
+        name: _load_timed_stream(episode_dir, name, time_basis=time_basis)
+        for name in ("reference", "hand_command", "joint_states", "imu_torso", "camera_head")
+    }
+    reference_stream = timed_streams["reference"]
+    reference_source_name = "reference"
+    if reference_stream.input_count == 0:
+        reference_stream = _load_timed_stream(
+            episode_dir, "retarget", time_basis=time_basis
+        )
+        timed_streams["retarget"] = reference_stream
+        reference_source_name = "retarget"
+    references = ReferenceSeries(
+        reference_stream.events,
+        # Source mode describes the age at the scheduled execution time of
+        # each frame in a reply chunk.  Receiver mode intentionally preserves
+        # the old converter's packet-level age for exact comparison.
+        account_for_scheduled_frame_age=(time_basis == TIME_BASIS_SOURCE),
+    )
+
+    hand_stream = timed_streams["hand_command"]
+    if hand_stream.input_count:
+        hand_commands = HandCommandSeries(hand_stream.events, legacy_controller=False)
+        hand_source_name = "hand_command"
+        selected_hand_stream = hand_stream
+    else:
+        controller_stream = _load_timed_stream(
+            episode_dir, "controller", time_basis=time_basis
+        )
+        timed_streams["controller"] = controller_stream
+        warnings.warn(
+            f"{episode_dir}: authoritative hand_command stream is missing; "
+            "deriving left/right grasp actions from legacy controller grip values "
+            "with deadzone=0.10 and full_scale=0.90",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        hand_commands = HandCommandSeries(controller_stream.events, legacy_controller=True)
+        hand_source_name = "controller"
+        selected_hand_stream = controller_stream
+
+    if time_basis == TIME_BASIS_SOURCE and not allow_partial_source_time:
+        required_timed_streams = {
+            "camera_head": timed_streams["camera_head"],
+            "joint_states": timed_streams["joint_states"],
+            "imu_torso": timed_streams["imu_torso"],
+            reference_source_name: reference_stream,
+            hand_source_name: selected_hand_stream,
+        }
+        incomplete = {
+            name: (stream.missing_time_count, stream.input_count)
+            for name, stream in required_timed_streams.items()
+            if stream.missing_time_count > 0
+        }
+        if incomplete:
+            details = ", ".join(
+                f"{name}={missing}/{total}"
+                for name, (missing, total) in sorted(incomplete.items())
+            )
+            raise ValueError(
+                f"Source-time mapping failed for {episode_dir}: {details}. "
+                "Use --allow_partial_source_time only for explicit diagnostic "
+                "conversion of incomplete legacy data, or use "
+                "--time_basis receiver to reproduce the legacy alignment."
+            )
+        regressed = {
+            name: (
+                stream.large_source_regression_count,
+                stream.max_source_regression_ms,
+            )
+            for name, stream in required_timed_streams.items()
+            if stream.large_source_regression_count > 0
+        }
+        if regressed:
+            details = ", ".join(
+                f"{name}={count} (max={maximum_ms:.3f} ms)"
+                for name, (count, maximum_ms) in sorted(regressed.items())
+            )
+            raise ValueError(
+                f"Large source-time regression detected for {episode_dir}: {details}. "
+                "This usually indicates a clock reset or corrupt stream order; "
+                "do not sort it silently into a training episode."
+            )
+
+    joints = JointStateSeries(timed_streams["joint_states"].events)
+    imu = PreviousEventSeries(timed_streams["imu_torso"].events)
+    camera_events = timed_streams["camera_head"].events
+    if time_basis == TIME_BASIS_SOURCE:
+        # Pre/post-roll remains in raw storage, but training observations must
+        # be captured inside the A-to-X active interval.
+        camera_events = [
+            event
+            for event in camera_events
+            if start_ns <= _series_time_ns(event) <= stop_ns
+        ]
+    camera_times = [_series_time_ns(event) for event in camera_events]
+
+    synchronization_diagnostics = {
+        name: {
+            "input_events": stream.input_count,
+            "timed_events": len(stream.events),
+            "missing_time_events": stream.missing_time_count,
+            "source_regressions": stream.source_regression_count,
+            "large_source_regressions": stream.large_source_regression_count,
+            "max_source_regression_ms": stream.max_source_regression_ms,
+        }
+        for name, stream in sorted(timed_streams.items())
+    }
+    synchronization_diagnostics["reference_selection"] = {
+        "input_events": reference_stream.input_count,
+        "timed_events": len(reference_stream.events),
+        "missing_time_events": reference_stream.missing_time_count,
+        "source_regressions": reference_stream.source_regression_count,
+        "large_source_regressions": reference_stream.large_source_regression_count,
+        "max_source_regression_ms": reference_stream.max_source_regression_ms,
+        "using_reference_stream": int(reference_source_name == "reference"),
+    }
 
     step_ns = int(round(1e9 / float(fps)))
     target_times = list(range(start_ns, stop_ns + 1, step_ns))
     samples: list[ConvertedSample] = []
     skip_counts: Counter[str] = Counter()
+    last_camera_index: Optional[int] = None
+    last_camera_anchor_ns: Optional[int] = None
 
     for target_ns in target_times:
         camera_index = _nearest_index(camera_times, target_ns)
@@ -550,14 +885,35 @@ def build_episode_samples(
             skip_counts["camera_missing"] += 1
             continue
         camera_event = camera_events[camera_index]
-        camera_age_ms = abs(camera_times[camera_index] - target_ns) / 1e6
-        if camera_age_ms > max_camera_age_ms:
+        camera_anchor_ns = camera_times[camera_index]
+        camera_grid_offset_ms = (camera_anchor_ns - target_ns) / 1e6
+        if abs(camera_grid_offset_ms) > max_camera_age_ms:
             skip_counts["camera_stale"] += 1
             continue
 
-        reference_action, reference_age_ms, retarget_age_ms, reference_gap_ms = (
-            references.interpolate(target_ns)
-        )
+        if time_basis == TIME_BASIS_SOURCE:
+            if camera_index == last_camera_index:
+                skip_counts["camera_reused"] += 1
+                continue
+            last_camera_index = camera_index
+            if last_camera_anchor_ns is not None and camera_anchor_ns <= last_camera_anchor_ns:
+                skip_counts["camera_non_monotonic"] += 1
+                continue
+            last_camera_anchor_ns = camera_anchor_ns
+            association_ns = camera_anchor_ns
+            reference_action, reference_age_ms, retarget_age_ms, reference_gap_ms = (
+                references.sample_previous(association_ns)
+            )
+        else:
+            # Exact compatibility path: the original receiver-clock converter
+            # associated every non-camera stream with the fixed FPS target,
+            # allowed one image to serve adjacent targets, and interpolated
+            # reference commands around that target.
+            association_ns = target_ns
+            reference_action, reference_age_ms, retarget_age_ms, reference_gap_ms = (
+                references.interpolate(association_ns)
+            )
+
         if reference_action is None:
             skip_counts["reference_missing"] += 1
             continue
@@ -571,7 +927,7 @@ def build_episode_samples(
             skip_counts["retarget_stale"] += 1
             continue
 
-        hand_action, hand_command_age_ms, hand_status = hand_commands.sample(target_ns)
+        hand_action, hand_command_age_ms, hand_status = hand_commands.sample(association_ns)
         if hand_action is None:
             skip_counts[f"hand_command_{hand_status}"] += 1
             continue
@@ -579,7 +935,7 @@ def build_episode_samples(
             skip_counts["hand_command_stale"] += 1
             continue
 
-        q, dq, joint_age_ms, missing_joints = joints.sample(target_ns)
+        q, dq, joint_age_ms, missing_joints = joints.sample(association_ns)
         if q is None or dq is None:
             skip_counts["joint_missing"] += 1
             if missing_joints:
@@ -589,7 +945,7 @@ def build_episode_samples(
             skip_counts["joint_stale"] += 1
             continue
 
-        imu_event, imu_age_ms = imu.sample(target_ns)
+        imu_event, imu_age_ms = imu.sample(association_ns)
         if imu_event is None:
             skip_counts["imu_missing"] += 1
             continue
@@ -653,7 +1009,7 @@ def build_episode_samples(
                 action=action,
                 timing_ms=np.asarray(
                     [
-                        camera_age_ms,
+                        camera_grid_offset_ms,
                         reference_age_ms,
                         hand_command_age_ms,
                         joint_age_ms,
@@ -661,6 +1017,7 @@ def build_episode_samples(
                     ],
                     dtype=np.float32,
                 ),
+                observation_timestamp_ns=camera_anchor_ns,
             )
         )
 
@@ -670,6 +1027,8 @@ def build_episode_samples(
         samples=samples,
         candidate_count=len(target_times),
         skip_counts=dict(skip_counts),
+        time_basis=time_basis,
+        synchronization_diagnostics=synchronization_diagnostics,
     )
 
 
@@ -713,6 +1072,11 @@ def _create_lerobot_dataset(
             "shape": (len(OBSERVATION_STATE_NAMES),),
             "names": OBSERVATION_STATE_NAMES,
         },
+        "sync.timing_ms": {
+            "dtype": "float32",
+            "shape": (len(TIMING_NAMES),),
+            "names": TIMING_NAMES,
+        },
         "action": {
             "dtype": "float32",
             "shape": (len(ACTION_NAMES),),
@@ -735,6 +1099,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output_root", default="~/Datasets/x2_vr/lerobot_v3")
     parser.add_argument("--repo_id", default="local/x2_vr")
     parser.add_argument("--fps", type=int, default=25)
+    parser.add_argument(
+        "--time_basis",
+        choices=TIME_BASES,
+        default=TIME_BASIS_SOURCE,
+        help=(
+            "Use source/header timestamps (recommended) or reproduce the legacy "
+            "recorder-arrival alignment"
+        ),
+    )
+    parser.add_argument(
+        "--allow_partial_source_time",
+        action="store_true",
+        help=(
+            "Allow source-time conversion after dropping raw events whose source "
+            "clock cannot be mapped. Diagnostic/legacy escape hatch only; strict "
+            "source conversion fails by default."
+        ),
+    )
     parser.add_argument("--max_camera_age_ms", type=float, default=100.0)
     parser.add_argument("--max_reference_age_ms", type=float, default=60.0)
     parser.add_argument("--max_reference_gap_ms", type=float, default=120.0)
@@ -790,20 +1172,23 @@ def main() -> None:
             max_hand_command_age_ms=args.max_hand_command_age_ms,
             max_joint_age_ms=args.max_joint_age_ms,
             max_imu_age_ms=args.max_imu_age_ms,
+            time_basis=args.time_basis,
+            allow_partial_source_time=args.allow_partial_source_time,
         )
         converted.append(result)
         total_candidates += result.candidate_count
         total_samples += len(result.samples)
         print(
             f"[convert] {episode_dir.name}: accepted={len(result.samples)}/"
-            f"{result.candidate_count}, skipped={result.skip_counts}"
+            f"{result.candidate_count}, time_basis={result.time_basis}, "
+            f"skipped={result.skip_counts}, sync={result.synchronization_diagnostics}"
         )
 
     print(
         f"[convert] total accepted={total_samples}/{total_candidates} "
         f"({100.0 * total_samples / max(1, total_candidates):.1f}%)"
     )
-    output_segments: list[tuple[str, list[ConvertedSample]]] = []
+    output_segments: list[tuple[EpisodeSamples, list[ConvertedSample]]] = []
     short_fragment_frames = 0
     for episode in converted:
         segments, dropped_short = split_contiguous_samples(
@@ -812,7 +1197,7 @@ def main() -> None:
             min_frames=args.min_segment_frames,
         )
         short_fragment_frames += dropped_short
-        output_segments.extend((episode.task, segment) for segment in segments)
+        output_segments.extend((episode, segment) for segment in segments)
     if not output_segments:
         raise RuntimeError(
             "All synchronized episodes are empty; inspect missing/stale counters above"
@@ -831,7 +1216,8 @@ def main() -> None:
         first_sample = output_segments[0][1][0]
         print(
             f"[convert] dry-run OK: image={first_shape}, "
-            f"state={first_sample.state.shape}, action={first_sample.action.shape}"
+            f"state={first_sample.state.shape}, action={first_sample.action.shape}, "
+            f"timing={first_sample.timing_ms.shape}, time_basis={args.time_basis}"
         )
         return
 
@@ -857,7 +1243,7 @@ def main() -> None:
         image_shape=first_shape,
     )
     try:
-        for task, segment in output_segments:
+        for episode, segment in output_segments:
             for sample in segment:
                 rgb = _decode_rgb(
                     sample.image_path,
@@ -867,16 +1253,47 @@ def main() -> None:
                     {
                         "observation.images.head": rgb,
                         "observation.state": sample.state.astype(np.float32, copy=False),
+                        "sync.timing_ms": sample.timing_ms.astype(
+                            np.float32, copy=False
+                        ),
                         "action": sample.action.astype(np.float32, copy=False),
-                        "task": task,
+                        "task": episode.task,
                     }
                 )
             dataset.save_episode()
     finally:
         dataset.finalize()
 
+    conversion_report = _conversion_report_payload(
+        raw_root=raw_root,
+        output_root=output_root,
+        repo_id=args.repo_id,
+        fps=args.fps,
+        time_basis=args.time_basis,
+        allow_partial_source_time=args.allow_partial_source_time,
+        max_camera_age_ms=args.max_camera_age_ms,
+        max_reference_age_ms=args.max_reference_age_ms,
+        max_reference_gap_ms=args.max_reference_gap_ms,
+        max_retarget_age_ms=args.max_retarget_age_ms,
+        max_hand_command_age_ms=args.max_hand_command_age_ms,
+        max_joint_age_ms=args.max_joint_age_ms,
+        max_imu_age_ms=args.max_imu_age_ms,
+        camera_rotation_deg=args.camera_rotation_deg,
+        min_segment_frames=args.min_segment_frames,
+        require_success=args.require_success,
+        converted=converted,
+        output_segments=output_segments,
+        short_fragment_frames_dropped=short_fragment_frames,
+    )
+    _write_conversion_report(
+        staging_root / "conversion_report.json", conversion_report
+    )
+
     staging_root.replace(output_root)
-    print(f"[convert] LeRobotDataset v3 written to {output_root}")
+    print(
+        f"[convert] LeRobotDataset v3 written to {output_root}; "
+        f"provenance={output_root / 'conversion_report.json'}"
+    )
 
 
 if __name__ == "__main__":

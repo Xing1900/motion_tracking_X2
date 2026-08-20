@@ -25,15 +25,15 @@ from typing import Any, Dict, Optional
 
 try:
     from .camera_tap_client import CameraTapClient
-    from .raw_episode_writer import RawEpisodeManager, ros_stamp_to_ns
+    from .raw_episode_writer import RawEpisodeManager, event_monotonic_ns, ros_stamp_to_ns
     from .schema import TELEOP_TAP_SCHEMA_VERSION, X2_TRACKING_JOINT_NAMES
 except ImportError:  # Direct execution from this directory.
     from camera_tap_client import CameraTapClient
-    from raw_episode_writer import RawEpisodeManager, ros_stamp_to_ns
+    from raw_episode_writer import RawEpisodeManager, event_monotonic_ns, ros_stamp_to_ns
     from schema import TELEOP_TAP_SCHEMA_VERSION, X2_TRACKING_JOINT_NAMES
 
 
-DEFAULT_CAMERA_TOPIC = "/aima/hal/sensor/rgbd_head_front/rgb_image/compressed"
+DEFAULT_CAMERA_TOPIC = "/aima/hal/sensor/rgb_head_front_center/rgb_image/compressed"
 DEFAULT_HAND_STATUS_TOPIC = "/vr_hand_controller/status"
 DEFAULT_AIMDK_JOINT_TOPICS = [
     "/aima/hal/joint/leg/state",
@@ -69,8 +69,53 @@ SENSOR_PROFILES = {
 }
 
 
+class LatestEventSlot:
+    """Thread-safe single-event slot used for coalesced high-bandwidth data."""
+
+    def __init__(self) -> None:
+        self._event: Optional[Dict[str, Any]] = None
+        self._lock = threading.Lock()
+
+    def replace(self, event: Dict[str, Any]) -> bool:
+        """Store ``event`` and return whether an older pending event was replaced."""
+
+        with self._lock:
+            replaced = self._event is not None
+            self._event = event
+            return replaced
+
+    def take(self) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            event = self._event
+            self._event = None
+            return event
+
+    def take_if_not_after(self, timestamp_ns: int) -> Optional[Dict[str, Any]]:
+        """Take the pending event only when it is no newer than ``timestamp_ns``."""
+
+        with self._lock:
+            if self._event is None:
+                return None
+            if event_monotonic_ns(self._event) > int(timestamp_ns):
+                return None
+            event = self._event
+            self._event = None
+            return event
+
+    def pending(self) -> bool:
+        with self._lock:
+            return self._event is not None
+
+
 class IngressQueue:
-    """Bounded callback queue with per-stream receive/drop accounting."""
+    """Bounded FIFO plus a coalesced latest-only camera slot.
+
+    Joint, IMU, hand and controller traffic retain normal FIFO semantics.  A
+    direct ROS callback or TCP camera-tap reader uses
+    :meth:`put_latest_camera`, so slow image writes can retain at most one
+    not-yet-dispatched compressed frame instead of filling the shared FIFO
+    with stale megabyte-sized messages.
+    """
 
     def __init__(self, maxsize: int) -> None:
         self.queue: queue.Queue[Dict[str, Any]] = queue.Queue(maxsize=max(1, int(maxsize)))
@@ -78,31 +123,129 @@ class IngressQueue:
         self._dropped: Counter[str] = Counter()
         self._peak_size = 0
         self._lock = threading.Lock()
+        self._latest_camera = LatestEventSlot()
+        self._wake_event = threading.Event()
 
     def put(self, event: Dict[str, Any]) -> None:
         stream = str(event.get("stream", "unknown"))
         with self._lock:
             self._received[stream] += 1
+        inserted = False
         try:
             self.queue.put_nowait(event)
+            inserted = True
         except queue.Full:
             if stream == "controller":
                 # Preserve the newest button sample (and therefore start/stop
-                # edges) by sacrificing one older queued data event.
-                try:
-                    evicted = self.queue.get_nowait()
-                    self.queue.task_done()
+                # edges) by sacrificing one older non-controller event.  Never
+                # evict a queued release/press sample to make room for another
+                # controller sample: doing so can erase the next rising edge.
+                evicted = self._evict_oldest_non_controller()
+                if evicted is not None:
                     with self._lock:
                         self._dropped[str(evicted.get("stream", "unknown"))] += 1
-                    self.queue.put_nowait(event)
-                except (queue.Empty, queue.Full):
+                    try:
+                        self.queue.put_nowait(event)
+                        inserted = True
+                    except queue.Full:
+                        with self._lock:
+                            self._dropped[stream] += 1
+                else:
                     with self._lock:
                         self._dropped[stream] += 1
             else:
                 with self._lock:
                     self._dropped[stream] += 1
+        if inserted:
+            self._wake_event.set()
         with self._lock:
-            self._peak_size = max(self._peak_size, self.queue.qsize())
+            self._peak_size = max(self._peak_size, self.size())
+
+    def _evict_oldest_non_controller(self) -> Optional[Dict[str, Any]]:
+        """Remove one queued data event while preserving all button samples."""
+
+        # queue.Queue exposes no selective removal API.  Its documented mutex
+        # protects the internal deque and completion counters used here.
+        with self.queue.mutex:
+            for index, candidate in enumerate(self.queue.queue):
+                if str(candidate.get("stream", "unknown")) == "controller":
+                    continue
+                evicted = self.queue.queue[index]
+                del self.queue.queue[index]
+                self.queue.unfinished_tasks -= 1
+                if self.queue.unfinished_tasks == 0:
+                    self.queue.all_tasks_done.notify_all()
+                self.queue.not_full.notify()
+                return evicted
+        return None
+
+    def put_latest_camera(self, event: Dict[str, Any]) -> None:
+        """Coalesce a camera event outside the public FIFO."""
+
+        stream = str(event.get("stream", "unknown"))
+        with self._lock:
+            self._received[stream] += 1
+        if self._latest_camera.replace(event):
+            # Keep this separate from camera transport/FIFO loss.  It means a
+            # valid callback was deliberately superseded before disk dispatch.
+            self.note_drop("camera_coalesced")
+        self._wake_event.set()
+        with self._lock:
+            self._peak_size = max(self._peak_size, self.size())
+
+    def _fifo_head_time_ns(self) -> Optional[int]:
+        # queue.Queue has no public peek.  Reading its deque under the queue's
+        # own mutex is safe and does not remove or re-order the event.
+        with self.queue.mutex:
+            if not self.queue.queue:
+                return None
+            return event_monotonic_ns(self.queue.queue[0])
+
+    def _try_get_next(self) -> Optional[tuple[Dict[str, Any], bool]]:
+        """Return (event, came_from_fifo), approximately in receive-time order."""
+
+        fifo_head_ns = self._fifo_head_time_ns()
+        if fifo_head_ns is None:
+            camera_event = self._latest_camera.take()
+            if camera_event is not None:
+                return camera_event, False
+        else:
+            # Do not let a newer coalesced image overtake older controller
+            # edges or state messages already waiting in the FIFO.
+            camera_event = self._latest_camera.take_if_not_after(fifo_head_ns)
+            if camera_event is not None:
+                return camera_event, False
+
+        try:
+            return self.queue.get_nowait(), True
+        except queue.Empty:
+            # A producer may have changed the FIFO between peek and get.
+            camera_event = self._latest_camera.take()
+            return None if camera_event is None else (camera_event, False)
+
+    def get_next(self, timeout: float) -> Optional[tuple[Dict[str, Any], bool]]:
+        """Wait for either FIFO work or the latest coalesced camera frame."""
+
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        while True:
+            item = self._try_get_next()
+            if item is not None:
+                return item
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                return None
+            self._wake_event.clear()
+            # Close the clear/wait race by checking both sources once more.
+            item = self._try_get_next()
+            if item is not None:
+                return item
+            self._wake_event.wait(remaining)
+
+    def empty(self) -> bool:
+        return self.queue.empty() and not self._latest_camera.pending()
+
+    def wake(self) -> None:
+        self._wake_event.set()
 
     def note_drop(self, stream: str, count: int = 1) -> None:
         if count <= 0:
@@ -119,7 +262,7 @@ class IngressQueue:
             return dict(self._dropped)
 
     def size(self) -> int:
-        return self.queue.qsize()
+        return self.queue.qsize() + int(self._latest_camera.pending())
 
     def peak_size(self) -> int:
         with self._lock:
@@ -127,58 +270,82 @@ class IngressQueue:
 
 
 class EventDispatcher:
-    def __init__(self, ingress: IngressQueue, manager: RawEpisodeManager) -> None:
+    def __init__(
+        self,
+        ingress: IngressQueue,
+        manager: RawEpisodeManager,
+        *,
+        join_timeout_s: float = 10.0,
+    ) -> None:
         self.ingress = ingress
         self.manager = manager
         self.stop_event = threading.Event()
         self.fatal_exception: Optional[BaseException] = None
+        self.join_timeout_s = max(0.0, float(join_timeout_s))
         self.thread = threading.Thread(target=self._run, name="x2-raw-writer", daemon=True)
 
     def start(self) -> None:
         self.thread.start()
 
     def _run(self) -> None:
-        while not self.stop_event.is_set() or not self.ingress.queue.empty():
-            try:
-                event = self.ingress.queue.get(timeout=0.05)
-            except queue.Empty:
+        while not self.stop_event.is_set() or not self.ingress.empty():
+            item = self.ingress.get_next(timeout=0.05)
+            if item is None:
                 try:
                     self.manager.tick()
                 except BaseException as exc:
                     self.fatal_exception = exc
                     self.stop_event.set()
+                    self.manager.request_abort()
                     print(f"[recorder] fatal writer error: {exc}")
                     return
                 continue
+            event, came_from_fifo = item
             try:
                 self.manager.handle_event(event)
             except BaseException as exc:
                 self.fatal_exception = exc
                 self.stop_event.set()
+                self.manager.request_abort()
                 print(f"[recorder] fatal writer error: {exc}")
                 return
             finally:
-                self.ingress.queue.task_done()
+                if came_from_fifo:
+                    self.ingress.queue.task_done()
             # Do not finalize post-roll while already-received events remain in
             # the writer backlog.  Raw may contain a little extra tail; the
             # converter crops exactly at the stop trigger.
-            if self.ingress.queue.empty():
+            if self.ingress.empty():
                 try:
                     self.manager.tick()
                 except BaseException as exc:
                     self.fatal_exception = exc
                     self.stop_event.set()
+                    self.manager.request_abort()
                     print(f"[recorder] fatal writer error: {exc}")
                     return
 
     def close(self) -> None:
         self.stop_event.set()
-        self.thread.join(timeout=10.0)
+        self.ingress.wake()
+        self.thread.join(timeout=self.join_timeout_s)
         if self.thread.is_alive():
-            print("[recorder] writer did not stop within 10 s; preserving partial episode")
+            self.manager.request_abort()
+            if self.fatal_exception is None:
+                self.fatal_exception = TimeoutError(
+                    "recorder writer did not stop within "
+                    f"{self.join_timeout_s:.3f} s"
+                )
+            print(
+                "[recorder] writer did not stop within "
+                f"{self.join_timeout_s:.3f} s; preserving partial episode"
+            )
         else:
             try:
-                self.manager.close()
+                if self.fatal_exception is not None:
+                    self.manager.abort()
+                else:
+                    self.manager.close()
             except BaseException as exc:
                 if self.fatal_exception is None:
                     self.fatal_exception = exc
@@ -299,6 +466,8 @@ def _build_ros_node(ingress: IngressQueue, args: argparse.Namespace) -> Any:
             # attribute duplicates entries and makes ``destroy_node()`` fail.
             self._owned_subscriptions = []
             self._callback_group = ReentrantCallbackGroup()
+            self._camera_receive_sequence = 0
+            self._camera_sequence_lock = threading.Lock()
 
             reliability = (
                 QoSReliabilityPolicy.RELIABLE
@@ -389,6 +558,9 @@ def _build_ros_node(ingress: IngressQueue, args: argparse.Namespace) -> Any:
             }
 
         def _on_camera(self, message: Any) -> None:
+            with self._camera_sequence_lock:
+                self._camera_receive_sequence += 1
+                camera_receive_sequence = self._camera_receive_sequence
             event = self._base_event(
                 "camera_head", ros_stamp_to_ns(message.header.stamp), message.header.frame_id
             )
@@ -396,10 +568,14 @@ def _build_ros_node(ingress: IngressQueue, args: argparse.Namespace) -> Any:
                 {
                     "topic": args.camera_topic,
                     "format": str(message.format),
+                    "sequence": camera_receive_sequence,
+                    "sequence_source": "recorder_ros_callback",
+                    "source_message_type": "sensor_msgs/msg/CompressedImage",
+                    "encoded_size_bytes": len(message.data),
                     "data": bytes(message.data),
                 }
             )
-            ingress.put(event)
+            ingress.put_latest_camera(event)
 
         def _on_joint_state(self, topic: str, message: Any) -> None:
             event = self._base_event(
@@ -545,7 +721,7 @@ def main() -> None:
     camera_tap = (
         CameraTapClient(
             args.camera_tap_addr,
-            on_event=ingress.put,
+            on_event=ingress.put_latest_camera,
             note_drop=ingress.note_drop,
         )
         if args.camera_tap_addr
