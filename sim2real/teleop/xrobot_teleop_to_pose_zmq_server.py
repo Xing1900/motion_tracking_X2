@@ -370,11 +370,26 @@ class LowLatencyTeleopPoseZMQServer:
         # PUB socket so XR/retarget/control callbacks are never blocked by I/O.
         self.tap_bind_addr = str(args.tap_bind_addr).strip()
         self.tap_accepting = bool(self.tap_bind_addr)
+        requested_tap_streams = {
+            str(stream).strip()
+            for stream in getattr(args, "tap_streams", ["*"])
+            if str(stream).strip()
+        }
+        self.tap_streams: Optional[frozenset[str]] = (
+            None
+            if not requested_tap_streams or "*" in requested_tap_streams
+            else frozenset(requested_tap_streams)
+        )
         self.tap_queue: queue.Queue[tuple[str, Dict[str, Any]]] = queue.Queue(
             maxsize=max(1, int(args.tap_queue_size))
         )
         self.tap_stats_lock = threading.Lock()
         self.tap_next_seq = 0
+        # Keep a sequence per published topic in addition to the legacy global
+        # sequence. A filtered SUB socket cannot use the global sequence to
+        # distinguish intentional topic filtering from an actual transport
+        # gap, while a per-topic sequence remains continuous.
+        self.tap_topic_next_seq: Dict[str, int] = {}
         self.tap_enqueued_count = 0
         self.tap_sent_count = 0
         self.tap_queue_drop_count = 0
@@ -719,12 +734,13 @@ class LowLatencyTeleopPoseZMQServer:
             return None
 
     def _enqueue_tap(self, topic: str, payload: Dict[str, Any]) -> None:
-        if not self.tap_accepting:
+        if not self._tap_enabled(topic):
             return
 
+        topic = str(topic)
         event = {
             "tap_schema_version": 1,
-            "type": str(topic),
+            "type": topic,
             "bridge_enqueue_monotonic_ns": time.monotonic_ns(),
             "bridge_enqueue_wall_time_ns": time.time_ns(),
             **payload,
@@ -734,11 +750,19 @@ class LowLatencyTeleopPoseZMQServer:
         with self.tap_stats_lock:
             event["tap_seq"] = self.tap_next_seq
             self.tap_next_seq += 1
+            topic_next_seq = self.tap_topic_next_seq.get(topic, 0)
+            event["tap_topic_seq"] = topic_next_seq
+            self.tap_topic_next_seq[topic] = topic_next_seq + 1
             try:
-                self.tap_queue.put_nowait((str(topic), event))
+                self.tap_queue.put_nowait((topic, event))
                 self.tap_enqueued_count += 1
             except queue.Full:
                 self.tap_queue_drop_count += 1
+
+    def _tap_enabled(self, topic: str) -> bool:
+        return self.tap_accepting and (
+            self.tap_streams is None or str(topic) in self.tap_streams
+        )
 
     def _count_tap_prepare_drop(self) -> None:
         """Account for a tap payload that could not be prepared.
@@ -851,7 +875,7 @@ class LowLatencyTeleopPoseZMQServer:
         if should_wake_retarget:
             # Wake the control path before doing any recorder-only copying.
             self.vr_frame_event.set()
-            if self.tap_accepting:
+            if self._tap_enabled("xr"):
                 try:
                     body_poses = self._copy_pose_list(body.get("poses", None))
                     headset_pose = self._copy_numeric_list(
@@ -1248,7 +1272,7 @@ class LowLatencyTeleopPoseZMQServer:
             recv_ns = int(payload["recv_ns"])
             self._append_retarget_frame(recv_ns=recv_ns, qpos=qpos_curr)
             self.retarget_count += 1
-            if self.tap_accepting:
+            if self._tap_enabled("retarget"):
                 try:
                     self._enqueue_tap(
                         "retarget",
@@ -1441,19 +1465,39 @@ class LowLatencyTeleopPoseZMQServer:
             seq_start = int(self.frame_seq)
             self.frame_seq += len(out_frames)
 
+            reply_now_ns = time.monotonic_ns()
             retarget_age_ms = None
             if request_start:
                 selected_recv_ns = sample_info.get("selected_recv_ns")
                 if selected_recv_ns is not None:
                     retarget_age_ms = int(
-                        max(0, time.monotonic_ns() - int(selected_recv_ns)) / 1e6
+                        max(0, reply_now_ns - int(selected_recv_ns)) / 1e6
                     )
             else:
                 retarget_frames = self._get_retarget_frames_snapshot()
                 if retarget_frames:
                     retarget_age_ms = int(
-                        max(0, time.monotonic_ns() - retarget_frames[-1].recv_ns) / 1e6
+                        max(0, reply_now_ns - retarget_frames[-1].recv_ns) / 1e6
                     )
+
+            # ``retarget_age_ms`` describes the newest available GMR output,
+            # which can be younger than the reference actually selected by
+            # the lookback sampler.  Carry the selected content age
+            # separately so controller-side dataset telemetry cannot mistake
+            # an old fallback/interpolated target for a fresh command.
+            reference_source_ns = sample_info.get("selected_recv_ns")
+            if reference_source_ns is None:
+                if sample_info.get("mode") == "interpolate":
+                    reference_source_ns = sample_info.get("target_ns")
+                else:
+                    reference_source_ns = sample_info.get("newer_ns")
+                    if reference_source_ns is None:
+                        reference_source_ns = sample_info.get("older_ns")
+            reference_source_age_ms = None
+            if reference_source_ns is not None:
+                reference_source_age_ms = round(
+                    max(0, reply_now_ns - int(reference_source_ns)) / 1e6, 3
+                )
 
             payload = {
                 "start": request_start,
@@ -1461,6 +1505,17 @@ class LowLatencyTeleopPoseZMQServer:
                 "chunk_size": len(out_frames),
                 "frame_seq_start": seq_start,
                 "retarget_age_ms": retarget_age_ms,
+                "reference_source_age_ms": reference_source_age_ms,
+                # Bridge and controller are intentionally robot-local and
+                # share CLOCK_MONOTONIC.  The absolute source stamp lets the
+                # controller include serialization/ZMQ/receiver queue delay
+                # in the age it later publishes to the recorder.
+                "reference_source_monotonic_ns": (
+                    None
+                    if reference_source_ns is None
+                    else int(reference_source_ns)
+                ),
+                "bridge_reply_monotonic_ns": int(reply_now_ns),
                 "t_rep_ms": int(time.time() * 1000),
                 "frames": [self._serialize_qpos_frame(x) for x in out_frames],
             }
@@ -1496,7 +1551,7 @@ class LowLatencyTeleopPoseZMQServer:
             except Exception as exc:
                 print(f"[Warning] reply send failed: {exc}")
             else:
-                if self.tap_accepting:
+                if self._tap_enabled("reference"):
                     try:
                         self._enqueue_tap(
                             "reference",
@@ -1518,6 +1573,13 @@ class LowLatencyTeleopPoseZMQServer:
                                 "sample_mode": sample_info.get("mode"),
                                 "sample_target_monotonic_ns": sample_info.get("target_ns"),
                                 "retarget_age_ms": retarget_age_ms,
+                                "reference_source_age_ms": reference_source_age_ms,
+                                "reference_source_monotonic_ns": (
+                                    None
+                                    if reference_source_ns is None
+                                    else int(reference_source_ns)
+                                ),
+                                "bridge_reply_monotonic_ns": int(reply_now_ns),
                                 "frames_qpos_root_xyz_quat_wxyz_dof": [
                                     np.asarray(frame, dtype=np.float32).reshape(-1)[:36].tolist()
                                     for frame in out_frames
@@ -1646,7 +1708,7 @@ class LowLatencyTeleopPoseZMQServer:
                     except Exception as exc:
                         print(f"[Warning] hand control send failed: {exc}")
 
-                if self.tap_accepting:
+                if self._tap_enabled("controller"):
                     try:
                         self._enqueue_tap(
                             "controller",
@@ -1819,6 +1881,14 @@ class LowLatencyTeleopPoseZMQServer:
         print(f"  hand_ctrl_bind_addr: {self.hand_ctrl_bind_addr or '<disabled>'}")
         print(f"  hand_ctrl_source_timeout_ms: {self.hand_ctrl_source_timeout_ns / 1e6:.3f}")
         print(f"  tap_bind_addr: {self.tap_bind_addr or '<disabled>'}")
+        print(
+            "  tap_streams: "
+            + (
+                "all"
+                if self.tap_streams is None
+                else ",".join(sorted(self.tap_streams))
+            )
+        )
         print(f"  ctrl_fps: {self.ctrl_fps}")
         print(f"  gmr_max_iter: {self.gmr_max_iter}")
         print("  chunk_size: fixed to 1 frame per reply")
@@ -2017,6 +2087,16 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=2048,
         help="Bounded recorder-tap queue; full queues drop events instead of blocking teleop",
+    )
+    parser.add_argument(
+        "--tap_streams",
+        nargs="+",
+        choices=["*", "xr", "retarget", "reference", "controller"],
+        default=["*"],
+        help=(
+            "Recorder tap streams to prepare/publish. Omit for all diagnostics; "
+            "use '--tap_streams controller reference' for low-overhead VLA recording."
+        ),
     )
     parser.add_argument("--min_link_height", type=float, default=0.0)
     parser.add_argument(

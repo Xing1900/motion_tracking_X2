@@ -38,7 +38,7 @@ from camera_tap_client import (  # noqa: E402
     parse_camera_tap_addr,
     read_camera_tap_frame,
 )
-from raw_episode_writer import RawEpisodeManager, RawEpisodeWriter  # noqa: E402
+from raw_episode_writer import RawEpisodeManager, RawEpisodeWriter, read_jsonl  # noqa: E402
 from schema import ACTION_NAMES, HAND_ACTION_NAMES, X2_TRACKING_JOINT_NAMES  # noqa: E402
 from synchronization import (  # noqa: E402
     TIME_BASIS_RECEIVER,
@@ -46,18 +46,35 @@ from synchronization import (  # noqa: E402
     source_time_point,
     timed_stream,
 )
+from tracking_telemetry import (  # noqa: E402
+    TRACKING_TELEMETRY_JOINT_COUNT,
+    TRACKING_TELEMETRY_SCHEMA_VERSION,
+    TRACKING_TELEMETRY_TOPIC,
+    TrackingTelemetryProtocolError,
+    TrackingTelemetrySequenceTracker,
+    parse_tracking_telemetry_parts,
+)
 from x2_vr_recorder import (  # noqa: E402
+    CameraIngressDispatcher,
     DEFAULT_AIMDK_IMU_TOPICS,
     DEFAULT_AIMDK_JOINT_TOPICS,
     DEFAULT_CAMERA_TOPIC,
     DEFAULT_HAND_STATUS_TOPIC,
+    DEFAULT_TRACKING_TAP_ADDR,
     EventDispatcher,
     IngressQueue,
+    REQUIRED_GROOT_PROVENANCE_FILES,
     SENSOR_PROFILES,
+    TapSequenceGapTracker,
+    _bridge_runtime_effective_params,
     _imu_stream_name,
     _hand_status_payload,
+    _hash_capture_provenance_files,
+    _hash_provenance_files,
     _joint_state_payload,
+    _profile_topics,
     _required_joint_topics,
+    _validate_shutdown_timeouts,
 )
 
 
@@ -102,7 +119,147 @@ def source_timed_event(
     return event
 
 
+def tracking_telemetry_payload(sequence: int = 0):
+    q = [float(index) / 100.0 for index in range(TRACKING_TELEMETRY_JOINT_COUNT)]
+    return {
+        "schema_version": TRACKING_TELEMETRY_SCHEMA_VERSION,
+        "stream": TRACKING_TELEMETRY_TOPIC,
+        "sequence": sequence,
+        "sample_monotonic_ns": 1_000_000_000 + sequence,
+        "sample_wall_time_ns": 1_700_000_001_000_000_000 + sequence,
+        "joint_count": TRACKING_TELEMETRY_JOINT_COUNT,
+        "joint_names": list(X2_TRACKING_JOINT_NAMES),
+        "vr_user_enabled": True,
+        "vr_session_active": True,
+        "reference_root_position": [0.0, 0.0, 0.8],
+        "reference_root_quaternion_wxyz": [1.0, 0.0, 0.0, 0.0],
+        "reference_joint_position": q,
+        "measured_joint_position": q,
+        "measured_joint_velocity": [0.0] * TRACKING_TELEMETRY_JOINT_COUNT,
+        "root_angular_velocity": [0.0, 0.0, 0.0],
+        "projected_gravity": [0.0, 0.0, -1.0],
+        "policy_action": q,
+        "command_joint_position": q,
+        "reference_source_age_ms": 12.5,
+        "reference_source_time_exact": True,
+        "reference_source_frame_sequence": sequence,
+        "reference_is_transition": False,
+        "reference_is_padded": False,
+        "reference_is_fallback": False,
+        "sensor_generation": 1000 + sequence,
+    }
+
+
 class RawEpisodeManagerTest(unittest.TestCase):
+    def test_per_topic_tap_sequence_does_not_treat_filtering_as_loss(self):
+        tracker = TapSequenceGapTracker(allow_legacy_global=False)
+        controller_0 = {"tap_seq": 10, "tap_topic_seq": 0}
+        reference_0 = {"tap_seq": 15, "tap_topic_seq": 0}
+        controller_2 = {"tap_seq": 20, "tap_topic_seq": 2}
+
+        self.assertEqual(tracker.observe("controller", controller_0), {})
+        self.assertEqual(tracker.observe("reference", reference_0), {})
+        self.assertEqual(
+            tracker.observe("controller", controller_2),
+            {"teleop_tap_transport.controller": 1},
+        )
+        self.assertEqual(controller_2["tap_topic_gap_before"], 1)
+
+    def test_old_bridge_global_tap_sequence_remains_full_profile_fallback(self):
+        full_tracker = TapSequenceGapTracker(allow_legacy_global=True)
+        first = {"tap_seq": 3}
+        after_gap = {"tap_seq": 6}
+
+        self.assertEqual(full_tracker.observe("controller", first), {})
+        self.assertEqual(
+            full_tracker.observe("reference", after_gap),
+            {"teleop_tap_transport": 2},
+        )
+        self.assertEqual(after_gap["tap_gap_before"], 2)
+
+        vla_tracker = TapSequenceGapTracker(allow_legacy_global=False)
+        self.assertEqual(vla_tracker.observe("controller", {"tap_seq": 3}), {})
+        self.assertEqual(vla_tracker.observe("reference", {"tap_seq": 6}), {})
+
+    def test_shutdown_timeout_budget_keeps_outer_watchdog_after_camera_drain(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manager = RawEpisodeManager(
+                output_root=root,
+                task="camera finalize budget",
+                pre_roll_s=0.0,
+                post_roll_s=0.0,
+                source_config={"camera_writer_join_timeout_s": 0.15},
+                drop_counts=lambda: {},
+            )
+            manager.handle_event(
+                timed_event(
+                    "controller",
+                    1_000_000_000,
+                    controller_buttons={"right_key_one": True, "left_key_one": False},
+                )
+            )
+            writer = manager._writer
+            self.assertIsNotNone(writer)
+
+            camera_write_entered = threading.Event()
+            release_camera_write = threading.Event()
+            original_persist = writer._persist_camera_event
+
+            def blocked_camera_write(*args):
+                camera_write_entered.set()
+                self.assertTrue(release_camera_write.wait(timeout=1.0))
+                return original_persist(*args)
+
+            writer._persist_camera_event = blocked_camera_write
+            manager.handle_event(
+                timed_event(
+                    "camera_head",
+                    1_050_000_000,
+                    format="png",
+                    data=VALID_PNG,
+                )
+            )
+            self.assertTrue(camera_write_entered.wait(timeout=1.0))
+            manager.handle_event(
+                timed_event(
+                    "controller",
+                    1_100_000_000,
+                    controller_buttons={"right_key_one": False, "left_key_one": True},
+                )
+            )
+
+            camera_finalize_entered = threading.Event()
+            original_stop_camera_writer = writer._stop_camera_writer
+
+            def observed_stop_camera_writer():
+                camera_finalize_entered.set()
+                return original_stop_camera_writer()
+
+            writer._stop_camera_writer = observed_stop_camera_writer
+            ingress = IngressQueue(maxsize=4)
+            dispatcher = EventDispatcher(ingress, manager, join_timeout_s=0.30)
+            dispatcher.start()
+            ingress.put(timed_event("reference", 1_150_000_000))
+            self.assertTrue(camera_finalize_entered.wait(timeout=1.0))
+
+            release_timer = threading.Timer(0.05, release_camera_write.set)
+            release_timer.start()
+            dispatcher.close()
+            release_timer.join(timeout=1.0)
+
+            self.assertIsNone(dispatcher.fatal_exception)
+            self.assertFalse(dispatcher.thread.is_alive())
+            manifest = json.loads(
+                (root / "episode_000000" / "manifest.json").read_text()
+            )
+            self.assertEqual(manifest["status"], "complete")
+
+    def test_shutdown_timeout_configuration_requires_outer_margin(self):
+        _validate_shutdown_timeouts(10.0, 15.0)
+        with self.assertRaisesRegex(ValueError, "finalization margin"):
+            _validate_shutdown_timeouts(10.0, 11.0)
+
     def test_controller_enqueue_never_evicts_queued_controller_edge(self):
         ingress = IngressQueue(maxsize=3)
         release = timed_event("controller", 100, edge="release")
@@ -387,7 +544,159 @@ class RawEpisodeManagerTest(unittest.TestCase):
             self.assertEqual(manifest["task"], "touch the red button")
             self.assertEqual(manifest["stream_counts"]["camera_head"], 1)
             self.assertEqual(manifest["ingress_drops"]["camera_head"], 2)
-            self.assertEqual(len(list((episode / "images" / "head_rgb").glob("*.png"))), 1)
+            self.assertEqual(
+                len(list((episode / "images" / "head_rgb").glob("*.png"))), 1
+            )
+
+    def test_start_uses_controller_receive_drop_snapshot(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            drops = {"camera_ingress_coalesced": 10}
+            manager = RawEpisodeManager(
+                output_root=Path(temporary),
+                task="drop snapshot",
+                pre_roll_s=0.0,
+                post_roll_s=0.0,
+                source_config={},
+                drop_counts=lambda: dict(drops),
+            )
+            manager.handle_event(
+                timed_event(
+                    "controller",
+                    100,
+                    recorder_ingress_drop_snapshot={
+                        "camera_ingress_coalesced": 3
+                    },
+                    controller_buttons={
+                        "right_key_one": True,
+                        "left_key_one": False,
+                    },
+                )
+            )
+            drops["camera_ingress_coalesced"] = 12
+            manager.handle_event(
+                timed_event(
+                    "controller",
+                    200,
+                    controller_buttons={
+                        "right_key_one": False,
+                        "left_key_one": True,
+                    },
+                )
+            )
+            manager.tick(now_ns=200)
+
+            manifest = json.loads(
+                (
+                    Path(temporary)
+                    / "episode_000000"
+                    / "manifest.json"
+                ).read_text()
+            )
+            self.assertEqual(
+                manifest["ingress_drops"]["camera_ingress_coalesced"], 9
+            )
+
+    def test_async_camera_writer_is_bounded_and_keeps_newest_pending_frames(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            writer = RawEpisodeWriter(
+                output_root=Path(temporary),
+                episode_index=0,
+                task="bounded camera writer",
+                start_monotonic_ns=1_000,
+                start_wall_time_ns=2,
+                source_config={
+                    "camera_writer_queue_frames": 2,
+                    "camera_writer_queue_bytes": 1024 * 1024,
+                },
+            )
+            original_persist = writer._persist_camera_event
+            first_write_entered = threading.Event()
+            release_first_write = threading.Event()
+            first_write = True
+
+            def blocked_first_write(*args):
+                nonlocal first_write
+                if first_write:
+                    first_write = False
+                    first_write_entered.set()
+                    self.assertTrue(release_first_write.wait(timeout=2.0))
+                return original_persist(*args)
+
+            writer._persist_camera_event = blocked_first_write
+            writer.write_event(
+                timed_event(
+                    "camera_head", 1_000, sequence=0, format="png", data=VALID_PNG
+                )
+            )
+            self.assertTrue(first_write_entered.wait(timeout=1.0))
+            for sequence in range(1, 5):
+                writer.write_event(
+                    timed_event(
+                        "camera_head",
+                        1_000 + sequence,
+                        sequence=sequence,
+                        format="png",
+                        data=VALID_PNG,
+                    )
+                )
+            release_first_write.set()
+
+            episode = writer.finalize(
+                status="complete",
+                stop_trigger_monotonic_ns=2_000,
+                success=None,
+                ingress_drops={},
+            )
+
+            manifest = json.loads((episode / "manifest.json").read_text())
+            camera_events = [
+                json.loads(line)
+                for line in (episode / "streams" / "camera_head.jsonl")
+                .read_text()
+                .splitlines()
+            ]
+            self.assertEqual([event["sequence"] for event in camera_events], [0, 3, 4])
+            self.assertEqual(manifest["stream_counts"]["camera_head"], 3)
+            self.assertEqual(manifest["ingress_drops"]["camera_writer_coalesced"], 2)
+            self.assertEqual(
+                len(list((episode / "images" / "head_rgb").glob("*.png"))), 3
+            )
+
+    def test_async_camera_failure_is_interrupted_and_propagated(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            writer = RawEpisodeWriter(
+                output_root=root,
+                episode_index=0,
+                task="camera failure",
+                start_monotonic_ns=1_000,
+                start_wall_time_ns=2,
+                source_config={},
+            )
+
+            def fail_write(*_args):
+                raise OSError("simulated camera disk failure")
+
+            writer._persist_camera_event = fail_write
+            writer.write_event(
+                timed_event(
+                    "camera_head", 1_000, sequence=0, format="png", data=VALID_PNG
+                )
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "asynchronous camera writer failed"):
+                writer.finalize(
+                    status="complete",
+                    stop_trigger_monotonic_ns=2_000,
+                    success=None,
+                    ingress_drops={},
+                )
+
+            manifest = json.loads(
+                (root / "episode_000000" / "manifest.json").read_text()
+            )
+            self.assertEqual(manifest["status"], "interrupted")
+            self.assertEqual(manifest["camera_writer_error"]["type"], "OSError")
 
     def test_controller_displaces_data_when_ingress_is_full(self):
         ingress = IngressQueue(maxsize=1)
@@ -415,6 +724,386 @@ class RawEpisodeManagerTest(unittest.TestCase):
         self.assertFalse(came_from_fifo)
         self.assertEqual(event["sequence"], 99)
         self.assertTrue(ingress.empty())
+
+    def test_camera_ingress_runs_while_state_dispatcher_is_blocked(self):
+        class SplitManager:
+            def __init__(self):
+                self.state_entered = threading.Event()
+                self.release_state = threading.Event()
+                self.camera_done = threading.Event()
+                self.camera_sequences = []
+
+            def handle_event(self, _event):
+                self.state_entered.set()
+                self.release_state.wait(timeout=2.0)
+
+            def handle_camera_event(self, event):
+                self.camera_sequences.append(event["sequence"])
+                if len(self.camera_sequences) == 30:
+                    self.camera_done.set()
+
+            def tick(self):
+                pass
+
+            def close(self):
+                pass
+
+            def request_abort(self):
+                pass
+
+            def abort(self):
+                pass
+
+        manager = SplitManager()
+        ingress = IngressQueue(maxsize=8)
+        dispatcher = EventDispatcher(ingress, manager)
+        camera_ingress = CameraIngressDispatcher(
+            manager,
+            max_frames=32,
+            max_bytes=1024,
+        )
+        dispatcher.start()
+        camera_ingress.start()
+        ingress.put(timed_event("reference", 100))
+        self.assertTrue(manager.state_entered.wait(timeout=1.0))
+
+        for sequence in range(30):
+            camera_ingress.put(
+                timed_event(
+                    "camera_head",
+                    101 + sequence,
+                    sequence=sequence,
+                    data=b"jpeg",
+                )
+            )
+
+        self.assertTrue(manager.camera_done.wait(timeout=1.0))
+        self.assertEqual(manager.camera_sequences, list(range(30)))
+        self.assertEqual(camera_ingress.drops(), {})
+
+        manager.release_state.set()
+        camera_ingress.close()
+        dispatcher.close()
+        self.assertIsNone(camera_ingress.fatal_exception)
+        self.assertIsNone(dispatcher.fatal_exception)
+
+    def test_manager_camera_route_is_not_blocked_by_state_writer_lock(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            manager = RawEpisodeManager(
+                output_root=Path(temporary),
+                task="independent manager camera route",
+                pre_roll_s=0.0,
+                post_roll_s=0.0,
+                source_config={},
+                drop_counts=lambda: {},
+            )
+            manager.handle_event(
+                timed_event(
+                    "controller",
+                    100,
+                    controller_buttons={
+                        "right_key_one": True,
+                        "left_key_one": False,
+                    },
+                )
+            )
+            writer = manager._writer
+            self.assertIsNotNone(writer)
+            state_entered = threading.Event()
+            release_state = threading.Event()
+            camera_persisted = threading.Event()
+            original_write_event = writer.write_event
+            original_persist_camera = writer._persist_camera_event
+
+            def blocked_state_write(event):
+                if event.get("stream") == "reference":
+                    state_entered.set()
+                    self.assertTrue(release_state.wait(timeout=2.0))
+                return original_write_event(event)
+
+            def observed_camera_persist(*args):
+                result = original_persist_camera(*args)
+                camera_persisted.set()
+                return result
+
+            writer.write_event = blocked_state_write
+            writer._persist_camera_event = observed_camera_persist
+            state_thread = threading.Thread(
+                target=manager.handle_event,
+                args=(timed_event("reference", 200),),
+            )
+            state_thread.start()
+            self.assertTrue(state_entered.wait(timeout=1.0))
+
+            # handle_event(reference) still owns manager._lock here. Camera
+            # routing uses _camera_route_lock and must enqueue/persist anyway.
+            manager.handle_camera_event(
+                timed_event(
+                    "camera_head",
+                    210,
+                    sequence=0,
+                    format="png",
+                    data=VALID_PNG,
+                )
+            )
+            self.assertTrue(camera_persisted.wait(timeout=1.0))
+
+            release_state.set()
+            state_thread.join(timeout=1.0)
+            self.assertFalse(state_thread.is_alive())
+            manager.handle_event(
+                timed_event(
+                    "controller",
+                    300,
+                    controller_buttons={
+                        "right_key_one": False,
+                        "left_key_one": True,
+                    },
+                )
+            )
+            manager.tick(now_ns=300)
+
+    def test_camera_ingress_is_bounded_and_drops_oldest(self):
+        class BlockingCameraManager:
+            def __init__(self):
+                self.entered = threading.Event()
+                self.release = threading.Event()
+                self.sequences = []
+
+            def handle_camera_event(self, event):
+                self.sequences.append(event["sequence"])
+                if event["sequence"] == 0:
+                    self.entered.set()
+                    self.release.wait(timeout=2.0)
+
+            def request_abort(self):
+                pass
+
+        manager = BlockingCameraManager()
+        camera_ingress = CameraIngressDispatcher(
+            manager,
+            max_frames=2,
+            max_bytes=1024,
+        )
+        camera_ingress.start()
+        camera_ingress.put(
+            timed_event("camera_head", 100, sequence=0, data=b"jpeg")
+        )
+        self.assertTrue(manager.entered.wait(timeout=1.0))
+        for sequence in (1, 2, 3):
+            camera_ingress.put(
+                timed_event(
+                    "camera_head",
+                    100 + sequence,
+                    sequence=sequence,
+                    data=b"jpeg",
+                )
+            )
+
+        manager.release.set()
+        camera_ingress.close()
+
+        self.assertEqual(manager.sequences, [0, 2, 3])
+        self.assertEqual(
+            camera_ingress.drops(), {"camera_ingress_coalesced": 1}
+        )
+        self.assertIsNone(camera_ingress.fatal_exception)
+
+    def test_future_camera_preroll_survives_delayed_start_edge(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manager = RawEpisodeManager(
+                output_root=root,
+                task="independent camera start boundary",
+                pre_roll_s=0.5,
+                post_roll_s=0.0,
+                source_config={},
+                drop_counts=lambda: {},
+            )
+            # The camera dispatcher may process this newer frame before the
+            # public state dispatcher reaches the older A edge.
+            manager.handle_camera_event(
+                timed_event(
+                    "camera_head",
+                    200,
+                    sequence=0,
+                    format="png",
+                    data=VALID_PNG,
+                )
+            )
+            manager.handle_event(
+                timed_event(
+                    "controller",
+                    100,
+                    controller_buttons={
+                        "right_key_one": True,
+                        "left_key_one": False,
+                    },
+                )
+            )
+            manager.handle_event(
+                timed_event(
+                    "controller",
+                    300,
+                    controller_buttons={
+                        "right_key_one": False,
+                        "left_key_one": True,
+                    },
+                )
+            )
+            manager.tick(now_ns=300)
+
+            manifest = json.loads(
+                (root / "episode_000000" / "manifest.json").read_text()
+            )
+            self.assertEqual(manifest["stream_counts"]["camera_head"], 1)
+            camera_events = list(
+                read_jsonl(
+                    root
+                    / "episode_000000"
+                    / "streams"
+                    / "camera_head.jsonl"
+                )
+            )
+            self.assertEqual([event["sequence"] for event in camera_events], [0])
+
+    def test_state_dispatcher_waits_for_camera_ingress_before_tick(self):
+        class TickManager:
+            def __init__(self):
+                self.camera_entered = threading.Event()
+                self.release_camera = threading.Event()
+                self.tick_called = threading.Event()
+
+            def handle_camera_event(self, _event):
+                self.camera_entered.set()
+                self.release_camera.wait(timeout=2.0)
+
+            def handle_event(self, _event):
+                pass
+
+            def tick(self):
+                self.tick_called.set()
+
+            def close(self):
+                pass
+
+            def request_abort(self):
+                pass
+
+            def abort(self):
+                pass
+
+        manager = TickManager()
+        camera_ingress = CameraIngressDispatcher(
+            manager,
+            max_frames=2,
+            max_bytes=1024,
+        )
+        camera_ingress.start()
+        camera_ingress.put(timed_event("camera_head", 100, data=b"jpeg"))
+        self.assertTrue(manager.camera_entered.wait(timeout=1.0))
+
+        ingress = IngressQueue(maxsize=2)
+        dispatcher = EventDispatcher(
+            ingress,
+            manager,
+            auxiliary_ingress_ready=camera_ingress.idle,
+        )
+        dispatcher.start()
+        self.assertFalse(manager.tick_called.wait(timeout=0.15))
+
+        manager.release_camera.set()
+        self.assertTrue(manager.tick_called.wait(timeout=1.0))
+        camera_ingress.close()
+        dispatcher.close()
+
+    def test_post_roll_finalizes_when_camera_backlog_is_past_deadline(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            manager = RawEpisodeManager(
+                output_root=Path(temporary),
+                task="post-roll camera watermark",
+                pre_roll_s=0.0,
+                post_roll_s=0.05,
+                source_config={},
+                drop_counts=lambda: {},
+            )
+            manager.handle_event(
+                timed_event(
+                    "controller",
+                    1_000_000_000,
+                    controller_buttons={
+                        "right_key_one": True,
+                        "left_key_one": False,
+                    },
+                )
+            )
+            manager.handle_event(
+                timed_event(
+                    "controller",
+                    1_100_000_000,
+                    controller_buttons={
+                        "right_key_one": False,
+                        "left_key_one": True,
+                    },
+                )
+            )
+            self.assertEqual(manager.finalize_deadline_ns, 1_150_000_000)
+
+            camera_entered = threading.Event()
+            release_camera = threading.Event()
+            episode_saved = threading.Event()
+            original_handle_camera = manager.handle_camera_event
+            original_finish = manager._finish_episode
+
+            def blocked_post_deadline_camera(event):
+                camera_entered.set()
+                self.assertTrue(release_camera.wait(timeout=2.0))
+                return original_handle_camera(event)
+
+            def observed_finish(*args, **kwargs):
+                result = original_finish(*args, **kwargs)
+                episode_saved.set()
+                return result
+
+            manager.handle_camera_event = blocked_post_deadline_camera
+            manager._finish_episode = observed_finish
+            camera_ingress = CameraIngressDispatcher(
+                manager,
+                max_frames=4,
+                max_bytes=1024,
+            )
+            camera_ingress.start()
+            camera_ingress.put(
+                timed_event(
+                    "camera_head",
+                    1_160_000_000,
+                    sequence=0,
+                    data=b"jpeg",
+                )
+            )
+            self.assertTrue(camera_entered.wait(timeout=1.0))
+            self.assertFalse(camera_ingress.idle())
+            self.assertTrue(
+                camera_ingress.ready_through(manager.finalize_deadline_ns)
+            )
+
+            ingress = IngressQueue(maxsize=2)
+            dispatcher = EventDispatcher(
+                ingress,
+                manager,
+                auxiliary_ingress_ready=lambda: camera_ingress.ready_through(
+                    manager.finalize_deadline_ns
+                ),
+            )
+            dispatcher.start()
+            self.assertTrue(episode_saved.wait(timeout=1.0))
+            self.assertEqual(manager.state, "waiting")
+
+            release_camera.set()
+            camera_ingress.close()
+            dispatcher.close()
+            self.assertIsNone(camera_ingress.fatal_exception)
+            self.assertIsNone(dispatcher.fatal_exception)
 
     def test_direct_camera_slot_is_thread_safe_under_concurrent_callbacks(self):
         ingress = IngressQueue(maxsize=4)
@@ -467,6 +1156,24 @@ class RawEpisodeManagerTest(unittest.TestCase):
             ["joint-old", "start-edge", "camera", "imu-new"],
         )
         self.assertEqual(fifo_items, 3)
+
+    def test_camera_bypasses_state_backlog_without_overtaking_controller_edge(self):
+        ingress = IngressQueue(maxsize=64)
+        for sequence in range(20):
+            ingress.put(
+                timed_event(
+                    "joint_states",
+                    100 + sequence,
+                    tag=f"joint-{sequence}",
+                )
+            )
+        ingress.put_latest_camera(timed_event("camera_head", 200, tag="camera"))
+        ingress.put(timed_event("controller", 250, tag="future-edge"))
+
+        event, came_from_fifo = ingress.get_next(timeout=0.0)
+
+        self.assertFalse(came_from_fifo)
+        self.assertEqual(event["tag"], "camera")
 
     def test_dispatcher_close_flushes_latest_camera_and_fifo(self):
         class RecordingManager:
@@ -622,6 +1329,59 @@ class RawEpisodeManagerTest(unittest.TestCase):
 
 
 class RecorderSensorAdapterTest(unittest.TestCase):
+    def test_groot_bridge_runtime_params_are_explicit_and_normalized(self):
+        values = {
+            "actual_human_height": 1.72,
+            "gmr_max_iter": 5,
+            "lookback_ms": 15,
+            "min_link_height": 0,
+            "min_link_height_align_strategy": "startup_fixed",
+            "min_link_height_bootstrap_frames": 10,
+        }
+        args = SimpleNamespace(
+            record_profile="groot_n17",
+            **{f"bridge_{name}": value for name, value in values.items()},
+        )
+
+        normalized = _bridge_runtime_effective_params(args)
+
+        self.assertEqual(normalized["actual_human_height"], 1.72)
+        self.assertEqual(normalized["lookback_ms"], 15.0)
+        self.assertEqual(normalized["min_link_height"], 0.0)
+        self.assertIn("recorder", REQUIRED_GROOT_PROVENANCE_FILES)
+
+        args.bridge_lookback_ms = None
+        with self.assertRaisesRegex(ValueError, "incomplete"):
+            _bridge_runtime_effective_params(args)
+
+        empty = SimpleNamespace(record_profile="groot_n17")
+        with self.assertRaisesRegex(ValueError, r"requires all --bridge_\*"):
+            _bridge_runtime_effective_params(empty)
+
+    def test_runtime_provenance_files_are_hashed_by_content(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            artifact = Path(temp_dir) / "policy.onnx"
+            artifact.write_bytes(b"x2-policy")
+            result = _hash_provenance_files(
+                [f"controller_policy={artifact}"]
+            )
+            self.assertEqual(result["controller_policy"]["size_bytes"], 9)
+            self.assertEqual(len(result["controller_policy"]["sha256"]), 64)
+            with self.assertRaisesRegex(ValueError, "duplicate"):
+                _hash_provenance_files(
+                    [
+                        f"controller_policy={artifact}",
+                        f"controller_policy={artifact}",
+                    ]
+                )
+
+        capture_provenance = _hash_capture_provenance_files([])
+        self.assertEqual(
+            Path(capture_provenance["recorder"]["path"]).resolve(),
+            (DATA_COLLECTION_DIR / "x2_vr_recorder.py").resolve(),
+        )
+        self.assertEqual(len(capture_provenance["recorder"]["sha256"]), 64)
+
     def test_default_camera_topic_matches_current_x2_aimdk_stream(self):
         self.assertEqual(
             DEFAULT_CAMERA_TOPIC,
@@ -705,6 +1465,23 @@ class RecorderSensorAdapterTest(unittest.TestCase):
         self.assertEqual(_imu_stream_name(DEFAULT_AIMDK_IMU_TOPICS[0], 0), "imu_torso")
         self.assertEqual(_imu_stream_name(DEFAULT_AIMDK_IMU_TOPICS[1], 1), "imu_chest")
 
+    def test_vla_profile_omits_head_and_chest_diagnostics(self):
+        joint_topics, imu_topics = _profile_topics("aimdk", "vla")
+
+        self.assertEqual(joint_topics, DEFAULT_AIMDK_JOINT_TOPICS[:3])
+        self.assertEqual(imu_topics, DEFAULT_AIMDK_IMU_TOPICS[:1])
+
+        full_joint_topics, full_imu_topics = _profile_topics("aimdk", "full")
+        self.assertEqual(full_joint_topics, DEFAULT_AIMDK_JOINT_TOPICS)
+        self.assertEqual(full_imu_topics, DEFAULT_AIMDK_IMU_TOPICS)
+
+    def test_groot_n17_profile_uses_atomic_telemetry_not_ros_state_topics(self):
+        joint_topics, imu_topics = _profile_topics("aimdk", "groot_n17")
+
+        self.assertEqual(joint_topics, [])
+        self.assertEqual(imu_topics, [])
+        self.assertEqual(DEFAULT_TRACKING_TAP_ADDR, "tcp://127.0.0.1:28707")
+
     def test_authoritative_hand_status_is_normalized(self):
         message = SimpleNamespace(
             sequence=42,
@@ -726,6 +1503,104 @@ class RecorderSensorAdapterTest(unittest.TestCase):
                 "source_message_type": "x1_protocol/msg/VrHandControlStatus",
             },
         )
+
+
+class TrackingTelemetryProtocolTest(unittest.TestCase):
+    @staticmethod
+    def _parts(payload):
+        return [
+            TRACKING_TELEMETRY_TOPIC.encode("ascii"),
+            json.dumps(payload, separators=(",", ":")).encode("utf-8"),
+        ]
+
+    def test_valid_payload_is_normalized_and_gets_source_wall_stamp(self):
+        payload = tracking_telemetry_payload(sequence=17)
+
+        event = parse_tracking_telemetry_parts(self._parts(payload))
+
+        self.assertEqual(event["sequence"], 17)
+        self.assertEqual(event["sensor_generation"], 1017)
+        self.assertEqual(event["source_timestamp_ns"], payload["sample_wall_time_ns"])
+        self.assertEqual(len(event["reference_joint_position"]), 29)
+        self.assertTrue(
+            all(isinstance(value, float) for value in event["policy_action"])
+        )
+
+    def test_rejects_schema_topic_dimension_and_nonfinite_values(self):
+        invalid_cases = []
+
+        wrong_schema = tracking_telemetry_payload()
+        wrong_schema["schema_version"] = 2
+        invalid_cases.append(self._parts(wrong_schema))
+
+        wrong_joint_count = tracking_telemetry_payload()
+        wrong_joint_count["joint_count"] = 28
+        invalid_cases.append(self._parts(wrong_joint_count))
+
+        wrong_joint_order = tracking_telemetry_payload()
+        wrong_joint_order["joint_names"][0], wrong_joint_order["joint_names"][1] = (
+            wrong_joint_order["joint_names"][1],
+            wrong_joint_order["joint_names"][0],
+        )
+        invalid_cases.append(self._parts(wrong_joint_order))
+
+        wrong_dimension = tracking_telemetry_payload()
+        wrong_dimension["measured_joint_position"] = [0.0] * 28
+        invalid_cases.append(self._parts(wrong_dimension))
+
+        nonfinite = tracking_telemetry_payload()
+        nonfinite["policy_action"][3] = float("nan")
+        invalid_cases.append(self._parts(nonfinite))
+
+        nonfinite_optional = tracking_telemetry_payload()
+        nonfinite_optional["reference_source_age_ms"] = float("inf")
+        invalid_cases.append(self._parts(nonfinite_optional))
+
+        invalid_optional_flag = tracking_telemetry_payload()
+        invalid_optional_flag["reference_is_fallback"] = 1
+        invalid_cases.append(self._parts(invalid_optional_flag))
+
+        invalid_generation = tracking_telemetry_payload()
+        invalid_generation["sensor_generation"] = -2
+        invalid_cases.append(self._parts(invalid_generation))
+
+        invalid_cases.append([b"wrong_topic", b"{}"])
+        invalid_cases.append([TRACKING_TELEMETRY_TOPIC.encode("ascii")])
+
+        for parts in invalid_cases:
+            with self.subTest(parts=parts[0]):
+                with self.assertRaises(TrackingTelemetryProtocolError):
+                    parse_tracking_telemetry_parts(parts)
+
+    def test_sensor_generation_is_optional_and_accepts_legacy_unavailable(self):
+        for unavailable in (None, -1):
+            payload = tracking_telemetry_payload()
+            payload["sensor_generation"] = unavailable
+            with self.subTest(unavailable=unavailable):
+                event = parse_tracking_telemetry_parts(self._parts(payload))
+                self.assertIsNone(event["sensor_generation"])
+
+        missing = tracking_telemetry_payload()
+        del missing["sensor_generation"]
+        self.assertIsNone(
+            parse_tracking_telemetry_parts(self._parts(missing))["sensor_generation"]
+        )
+
+    def test_sequence_tracker_reports_gap_reset_and_duplicate(self):
+        tracker = TrackingTelemetrySequenceTracker()
+        first = tracking_telemetry_payload(sequence=10)
+        after_gap = tracking_telemetry_payload(sequence=13)
+        reset = tracking_telemetry_payload(sequence=1)
+
+        self.assertEqual(tracker.observe(first), 0)
+        self.assertEqual(tracker.observe(after_gap), 2)
+        self.assertEqual(after_gap["tracking_telemetry_gap_before"], 2)
+        self.assertEqual(tracker.observe(reset), 0)
+        self.assertTrue(reset["tracking_telemetry_sequence_reset"])
+        with self.assertRaisesRegex(
+            TrackingTelemetryProtocolError, "duplicate telemetry sequence"
+        ):
+            tracker.observe(tracking_telemetry_payload(sequence=1))
 
 
 class CameraTapClientTest(unittest.TestCase):
@@ -850,17 +1725,32 @@ class CameraTapClientTest(unittest.TestCase):
         self.assertEqual(create_connection.call_count, 2)
 
     def test_tcp_camera_gap_and_local_coalescing_are_accounted_separately(self):
-        ingress = IngressQueue(maxsize=1)
+        class RecordingManager:
+            def __init__(self):
+                self.events = []
+
+            def handle_camera_event(self, event):
+                self.events.append(event)
+
+            def request_abort(self):
+                pass
+
+        manager = RecordingManager()
+        camera_ingress = CameraIngressDispatcher(
+            manager,
+            max_frames=1,
+            max_bytes=1024 * 1024,
+        )
 
         def on_event(event):
-            ingress.put_latest_camera(event)
-            if ingress.counts().get("camera_head") == 2:
+            camera_ingress.put(event)
+            if camera_ingress.counts().get("camera_head") == 2:
                 client._stop_event.set()
 
         client = CameraTapClient(
             "tcp://127.0.0.1:28706",
             on_event=on_event,
-            note_drop=ingress.note_drop,
+            note_drop=camera_ingress.note_drop,
             log_info=lambda _message: None,
             log_warning=lambda _message: None,
             connect_timeout_s=0.1,
@@ -880,14 +1770,14 @@ class CameraTapClientTest(unittest.TestCase):
             client._thread.join(timeout=2.0)
         client.close()
 
-        self.assertEqual(ingress.counts()["camera_head"], 2)
-        self.assertEqual(ingress.drops()["camera_tap_transport"], 1)
-        self.assertEqual(ingress.drops()["camera_coalesced"], 1)
-        self.assertTrue(ingress.queue.empty())
-        event, came_from_fifo = ingress.get_next(timeout=0.0)
-        self.assertFalse(came_from_fifo)
-        self.assertEqual(event["sequence"], 12)
-        self.assertEqual(event["camera_tap_gap_before"], 1)
+        camera_ingress.start()
+        camera_ingress.close()
+
+        self.assertEqual(camera_ingress.counts()["camera_head"], 2)
+        self.assertEqual(camera_ingress.drops()["camera_tap_transport"], 1)
+        self.assertEqual(camera_ingress.drops()["camera_ingress_coalesced"], 1)
+        self.assertEqual([event["sequence"] for event in manager.events], [12])
+        self.assertEqual(manager.events[0]["camera_tap_gap_before"], 1)
 
 
 class ConversionTest(unittest.TestCase):
@@ -1014,6 +1904,26 @@ class ConversionTest(unittest.TestCase):
         self.assertIsNotNone(point)
         self.assertEqual(point.time_ns, 1_000_000_000)
         self.assertEqual(point.apparent_latency_ms, 100.0)
+
+    def test_tracking_telemetry_maps_controller_sample_wall_time(self):
+        wall_epoch_ns = 1_700_000_000_000_000_000
+        event = tracking_telemetry_payload(sequence=2)
+        event.update(
+            {
+                "sample_monotonic_ns": 2_000_000_000,
+                "sample_wall_time_ns": wall_epoch_ns + 2_000_000_000,
+                "source_timestamp_ns": wall_epoch_ns + 2_000_000_000,
+                "recorder_recv_monotonic_ns": 2_015_000_000,
+                "recorder_recv_wall_time_ns": wall_epoch_ns + 2_015_000_000,
+            }
+        )
+
+        point = source_time_point(event, TRACKING_TELEMETRY_TOPIC)
+
+        self.assertIsNotNone(point)
+        self.assertEqual(point.time_ns, 2_000_000_000)
+        self.assertAlmostEqual(point.apparent_latency_ms, 15.0)
+        self.assertIn("controller_sample", point.origin)
 
     def test_reference_uses_command_time_not_gmr_sample_target(self):
         event = source_timed_event(

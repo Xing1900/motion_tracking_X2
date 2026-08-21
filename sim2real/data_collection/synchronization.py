@@ -139,6 +139,27 @@ def source_time_point(event: Dict[str, Any], stream: str) -> Optional[TimePoint]
 
     stream = str(stream)
 
+    # The controller telemetry worker timestamps each atomic policy snapshot
+    # with a paired steady-clock and Unix-wall value. Map the wall half through
+    # the recorder's receive clock pair so this remains correct both for the
+    # normal same-robot loopback path and for a remote recorder. The monotonic
+    # half remains in the raw event for controller-side jitter diagnostics.
+    if stream == "tracking_telemetry":
+        sample_monotonic_ns = _integer(event, "sample_monotonic_ns")
+        sample_wall_ns = _integer(event, "sample_wall_time_ns")
+        if (
+            sample_monotonic_ns is not None
+            and sample_monotonic_ns >= 0
+            and sample_wall_ns is not None
+        ):
+            mapped = map_wall_to_recorder_monotonic(
+                sample_wall_ns,
+                event,
+                origin="tracking_telemetry_controller_sample:via_paired_clock",
+            )
+            if mapped is not None:
+                return mapped
+
     # A reference event describes the command replied to C++.  The sample
     # target is the older GMR lookback time, not the action issue time.
     if stream == "reference":

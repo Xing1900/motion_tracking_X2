@@ -18,6 +18,7 @@ except ImportError:  # Direct script execution from this directory.
 
 
 _EPISODE_RE = re.compile(r"^\.?episode_(\d{6})(?:\.partial)?$")
+DEFAULT_CAMERA_WRITER_JOIN_TIMEOUT_S = 10.0
 
 
 def event_monotonic_ns(event: Dict[str, Any]) -> int:
@@ -100,8 +101,48 @@ class RawEpisodeWriter:
         self._active_stream_stats: Dict[str, Dict[str, int]] = {}
         self._active_joint_names: set[str] = set()
         self._active_joint_topic_stats: Dict[str, Dict[str, int]] = {}
+        effective_source_config = dict(source_config)
+        self._camera_queue_max_frames = int(
+            effective_source_config.setdefault("camera_writer_queue_frames", 24)
+        )
+        self._camera_queue_max_bytes = int(
+            effective_source_config.setdefault(
+                "camera_writer_queue_bytes", 64 * 1024 * 1024
+            )
+        )
+        self._camera_join_timeout_s = float(
+            effective_source_config.setdefault(
+                "camera_writer_join_timeout_s",
+                DEFAULT_CAMERA_WRITER_JOIN_TIMEOUT_S,
+            )
+        )
+        if self._camera_queue_max_frames < 1:
+            raise ValueError("camera_writer_queue_frames must be positive")
+        if self._camera_queue_max_bytes < 1:
+            raise ValueError("camera_writer_queue_bytes must be positive")
+        if self._camera_join_timeout_s <= 0.0:
+            raise ValueError("camera_writer_join_timeout_s must be positive")
+
+        self._camera_condition = threading.Condition()
+        self._camera_queue: Deque[tuple[Dict[str, Any], int, bytes]] = deque()
+        self._camera_queue_bytes = 0
+        self._camera_accepting = True
+        self._camera_stop_requested = False
+        self._camera_fatal_exception: Optional[BaseException] = None
+        self._camera_drop_counts: Counter[str] = Counter()
+        self._persisted_camera_events: list[tuple[int, Dict[str, Any]]] = []
+        self._camera_active_stats_finalized = False
+        self._camera_thread = threading.Thread(
+            target=self._camera_worker_main,
+            name=f"x2-camera-writer-{self.episode_index:06d}",
+            # A permanently blocked filesystem call must not keep the recorder
+            # process alive after the bounded finalize join has failed.  The
+            # hidden .partial directory remains the recovery boundary.
+            daemon=True,
+        )
+
         self._matching_event_requirements = self._normalize_matching_event_requirements(
-            source_config.get("minimum_matching_event_counts", [])
+            effective_source_config.get("minimum_matching_event_counts", [])
         )
         self._active_matching_event_counts: Counter[str] = Counter()
         self._manifest: Dict[str, Any] = {
@@ -120,11 +161,16 @@ class RawEpisodeWriter:
                 "pre_roll_s": source_config.get("pre_roll_s"),
                 "post_roll_s": source_config.get("post_roll_s"),
             },
-            "source_config": source_config,
+            "source_config": effective_source_config,
             "stream_counts": {},
             "ingress_drops": {},
         }
         _write_json(self.partial_dir / "manifest.json", self._manifest)
+        self._camera_thread.start()
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
 
     @staticmethod
     def _normalize_matching_event_requirements(
@@ -215,7 +261,12 @@ class RawEpisodeWriter:
     def _track_active_event(
         self, stream: str, event: Dict[str, Any], timestamp_ns: int
     ) -> None:
-        if timestamp_ns < self._start_monotonic_ns or self._validation_stop_ns is not None:
+        if timestamp_ns < self._start_monotonic_ns:
+            return
+        if (
+            self._validation_stop_ns is not None
+            and timestamp_ns > self._validation_stop_ns
+        ):
             return
         self._update_timing_stats(self._active_stream_stats, stream, timestamp_ns)
         for requirement in self._matching_event_requirements:
@@ -238,30 +289,179 @@ class RawEpisodeWriter:
                     self._active_joint_names.add(str(name))
 
     def mark_stop_trigger(self, timestamp_ns: int) -> None:
+        self._raise_if_camera_writer_failed()
         if self._validation_stop_ns is None:
             self._validation_stop_ns = int(timestamp_ns)
+
+    def _camera_writer_failure(self) -> Optional[BaseException]:
+        with self._camera_condition:
+            return self._camera_fatal_exception
+
+    def _raise_if_camera_writer_failed(self) -> None:
+        failure = self._camera_writer_failure()
+        if failure is not None:
+            raise RuntimeError("asynchronous camera writer failed") from failure
+
+    def _enqueue_camera_event(
+        self,
+        serializable: Dict[str, Any],
+        timestamp_ns: int,
+        image_data: bytes,
+    ) -> None:
+        image_size = len(image_data)
+        with self._camera_condition:
+            if self._camera_fatal_exception is not None:
+                raise RuntimeError("asynchronous camera writer failed") from (
+                    self._camera_fatal_exception
+                )
+            if not self._camera_accepting:
+                raise RuntimeError("camera writer is no longer accepting events")
+            if image_size > self._camera_queue_max_bytes:
+                self._camera_drop_counts["camera_writer_oversize"] += 1
+                return
+
+            while self._camera_queue and (
+                len(self._camera_queue) >= self._camera_queue_max_frames
+                or self._camera_queue_bytes + image_size > self._camera_queue_max_bytes
+            ):
+                _, _, dropped_data = self._camera_queue.popleft()
+                self._camera_queue_bytes -= len(dropped_data)
+                self._camera_drop_counts["camera_writer_coalesced"] += 1
+
+            self._camera_queue.append((serializable, int(timestamp_ns), image_data))
+            self._camera_queue_bytes += image_size
+            self._camera_condition.notify()
+
+    def _persist_camera_event(
+        self,
+        handle: Any,
+        serializable: Dict[str, Any],
+        timestamp_ns: int,
+        image_data: bytes,
+    ) -> None:
+        image_format = str(serializable.get("format", "jpeg")).lower()
+        suffix = ".png" if "png" in image_format else ".jpg"
+        filename = f"{self._camera_index:08d}_{timestamp_ns}{suffix}"
+        image_path = self.image_dir / filename
+        with image_path.open("wb") as image_handle:
+            image_handle.write(image_data)
+
+        serializable["image_path"] = str(image_path.relative_to(self.partial_dir))
+        serializable["encoded_size_bytes"] = len(image_data)
+        handle.write(
+            json.dumps(
+                serializable,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                default=_json_default,
+            )
+        )
+        handle.write("\n")
+
+        # Counts and active-window accounting must describe frames that really
+        # made it through both image and metadata writes, not merely enqueues.
+        self._camera_index += 1
+        self._counts["camera_head"] += 1
+        self._persisted_camera_events.append((int(timestamp_ns), serializable))
+
+    def _camera_worker_main(self) -> None:
+        camera_path = self.stream_dir / "camera_head.jsonl"
+        handle: Optional[Any] = None
+        failure: Optional[BaseException] = None
+        last_flush_ns = time.monotonic_ns()
+        try:
+            while True:
+                with self._camera_condition:
+                    while not self._camera_queue and not self._camera_stop_requested:
+                        self._camera_condition.wait()
+                    if not self._camera_queue and self._camera_stop_requested:
+                        break
+                    serializable, timestamp_ns, image_data = self._camera_queue.popleft()
+                    self._camera_queue_bytes -= len(image_data)
+
+                if handle is None:
+                    handle = camera_path.open(
+                        "a", encoding="utf-8", buffering=1024 * 1024
+                    )
+                self._persist_camera_event(
+                    handle, serializable, timestamp_ns, image_data
+                )
+                now_ns = time.monotonic_ns()
+                if now_ns - last_flush_ns >= 1_000_000_000:
+                    handle.flush()
+                    last_flush_ns = now_ns
+        except BaseException as exc:
+            failure = exc
+        finally:
+            if handle is not None:
+                try:
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                except BaseException as exc:
+                    if failure is None:
+                        failure = exc
+                finally:
+                    try:
+                        handle.close()
+                    except BaseException as exc:
+                        if failure is None:
+                            failure = exc
+
+            with self._camera_condition:
+                if failure is not None and self._camera_fatal_exception is None:
+                    self._camera_fatal_exception = failure
+                if failure is not None and self._camera_queue:
+                    self._camera_drop_counts["camera_writer_after_fatal"] += len(
+                        self._camera_queue
+                    )
+                    self._camera_queue.clear()
+                    self._camera_queue_bytes = 0
+                self._camera_accepting = False
+                self._camera_condition.notify_all()
+
+    def _stop_camera_writer(self) -> Optional[BaseException]:
+        with self._camera_condition:
+            self._camera_accepting = False
+            self._camera_stop_requested = True
+            self._camera_condition.notify_all()
+        self._camera_thread.join(timeout=self._camera_join_timeout_s)
+        if self._camera_thread.is_alive():
+            timeout_error = TimeoutError(
+                "camera writer did not drain within "
+                f"{self._camera_join_timeout_s:.3f} s"
+            )
+            with self._camera_condition:
+                if self._camera_fatal_exception is None:
+                    self._camera_fatal_exception = timeout_error
+            raise timeout_error
+        return self._camera_writer_failure()
+
+    def _finalize_camera_active_stats(self) -> None:
+        if self._camera_active_stats_finalized:
+            return
+        for timestamp_ns, event in self._persisted_camera_events:
+            self._track_active_event("camera_head", event, timestamp_ns)
+        self._camera_active_stats_finalized = True
+        self._persisted_camera_events.clear()
 
     def write_event(self, event: Dict[str, Any]) -> None:
         if self._closed:
             raise RuntimeError("Cannot write to a closed episode")
+        self._raise_if_camera_writer_failed()
         stream = str(event.get("stream", "unknown"))
         serializable = dict(event)
         timestamp_ns = event_monotonic_ns(serializable)
-        self._track_active_event(stream, serializable, timestamp_ns)
 
         if stream == "camera_head":
             image_data = serializable.pop("data", None)
             if not isinstance(image_data, (bytes, bytearray, memoryview)):
                 return
-            image_format = str(serializable.get("format", "jpeg")).lower()
-            suffix = ".png" if "png" in image_format else ".jpg"
-            filename = f"{self._camera_index:08d}_{timestamp_ns}{suffix}"
-            image_path = self.image_dir / filename
-            with image_path.open("wb") as handle:
-                handle.write(bytes(image_data))
-            serializable["image_path"] = str(image_path.relative_to(self.partial_dir))
-            serializable["encoded_size_bytes"] = len(image_data)
-            self._camera_index += 1
+            self._enqueue_camera_event(
+                serializable, timestamp_ns, bytes(image_data)
+            )
+            return
+
+        self._track_active_event(stream, serializable, timestamp_ns)
 
         handle = self._stream_handle(stream)
         handle.write(
@@ -295,20 +495,48 @@ class RawEpisodeWriter:
         if self._closed:
             return self.final_dir
 
+        if stop_trigger_monotonic_ns is not None and self._validation_stop_ns is None:
+            self._validation_stop_ns = int(stop_trigger_monotonic_ns)
+        camera_failure = self._stop_camera_writer()
+        abort_was_requested = (
+            abort_requested is not None and abort_requested()
+        )
+        propagate_camera_failure = (
+            camera_failure is not None and not abort_was_requested
+        )
+        self._finalize_camera_active_stats()
+
         for handle in self._handles.values():
             handle.flush()
             os.fsync(handle.fileno())
             handle.close()
         self._handles.clear()
 
-        if abort_requested is not None and abort_requested():
+        if camera_failure is not None:
+            status = "interrupted"
+            success = None
+            self._manifest["camera_writer_error"] = {
+                "type": type(camera_failure).__name__,
+                "message": str(camera_failure),
+            }
+        if abort_was_requested or (
+            abort_requested is not None and abort_requested()
+        ):
             status = "interrupted"
             success = None
 
         self._manifest["status"] = str(status)
         self._manifest["success"] = success
         self._manifest["stream_counts"] = dict(sorted(self._counts.items()))
-        self._manifest["ingress_drops"] = dict(sorted(ingress_drops.items()))
+        merged_drops: Counter[str] = Counter(
+            {
+                str(stream): int(count)
+                for stream, count in ingress_drops.items()
+                if int(count) > 0
+            }
+        )
+        merged_drops.update(self._camera_drop_counts)
+        self._manifest["ingress_drops"] = dict(sorted(merged_drops.items()))
         required_streams = [
             str(stream) for stream in self._manifest["source_config"].get("required_streams", [])
         ]
@@ -449,6 +677,10 @@ class RawEpisodeWriter:
 
         self.partial_dir.replace(self.final_dir)
         self._closed = True
+        if propagate_camera_failure:
+            raise RuntimeError(
+                "asynchronous camera writer failed; episode saved as interrupted"
+            ) from camera_failure
         return self.final_dir
 
 
@@ -477,6 +709,12 @@ class RawEpisodeManager:
         self.drop_counts = drop_counts
 
         self._pre_roll: Deque[Dict[str, Any]] = deque()
+        # Camera routing has its own lock/pre-roll so high-rate synchronous
+        # state JSON writes under _lock cannot delay the camera ingress worker.
+        # Episode start/finalize acquire _lock then _camera_route_lock; the
+        # camera path never acquires _lock, so the order cannot deadlock.
+        self._camera_pre_roll: Deque[Dict[str, Any]] = deque()
+        self._camera_route_lock = threading.Lock()
         self._writer: Optional[RawEpisodeWriter] = None
         self._next_episode_index = self._find_next_episode_index()
         self._prev_start = False
@@ -503,6 +741,13 @@ class RawEpisodeManager:
         with self._lock:
             return None if self._writer is None else self._writer.episode_index
 
+    @property
+    def finalize_deadline_ns(self) -> Optional[int]:
+        """Post-roll deadline used by independent ingress watermarks."""
+
+        with self._lock:
+            return self._finalize_deadline_ns
+
     def _find_next_episode_index(self) -> int:
         indices = []
         for child in self.output_root.iterdir():
@@ -519,6 +764,14 @@ class RawEpisodeManager:
         while self._pre_roll and event_monotonic_ns(self._pre_roll[0]) < cutoff_ns:
             self._pre_roll.popleft()
 
+    def _evict_camera_pre_roll(self, now_ns: int) -> None:
+        cutoff_ns = int(now_ns) - self.pre_roll_ns
+        while (
+            self._camera_pre_roll
+            and event_monotonic_ns(self._camera_pre_roll[0]) < cutoff_ns
+        ):
+            self._camera_pre_roll.popleft()
+
     @staticmethod
     def _button_state(event: Dict[str, Any], name: str) -> bool:
         buttons = event.get("controller_buttons")
@@ -530,8 +783,15 @@ class RawEpisodeManager:
             or trigger.get("bridge_recv_wall_time_ns")
             or time.time_ns()
         )
-        self._drop_baseline = self.drop_counts()
-        self._writer = RawEpisodeWriter(
+        trigger_drop_snapshot = trigger.get("recorder_ingress_drop_snapshot")
+        if isinstance(trigger_drop_snapshot, dict):
+            self._drop_baseline = {
+                str(name): max(0, int(count))
+                for name, count in trigger_drop_snapshot.items()
+            }
+        else:
+            self._drop_baseline = self.drop_counts()
+        new_writer = RawEpisodeWriter(
             output_root=self.output_root,
             episode_index=self._next_episode_index,
             task=self.task,
@@ -545,14 +805,31 @@ class RawEpisodeManager:
             (
                 event
                 for event in self._pre_roll
-                if cutoff_ns <= event_monotonic_ns(event) <= now_ns
+                if cutoff_ns <= event_monotonic_ns(event)
             ),
             key=event_monotonic_ns,
         )
+        # The independent camera dispatcher can route a frame received after
+        # this A edge before the state dispatcher reaches the edge.  Such a
+        # frame is already buffered with timestamp > now_ns and belongs to the
+        # new episode; retaining it avoids an A-boundary camera hole.
+        with self._camera_route_lock:
+            buffered_camera_events = sorted(
+                (
+                    event
+                    for event in self._camera_pre_roll
+                    if cutoff_ns <= event_monotonic_ns(event)
+                ),
+                key=event_monotonic_ns,
+            )
+            self._camera_pre_roll.clear()
+            self._writer = new_writer
+            for buffered_camera_event in buffered_camera_events:
+                new_writer.write_event(buffered_camera_event)
         for buffered_event in buffered_events:
-            self._writer.write_event(buffered_event)
+            new_writer.write_event(buffered_event)
         self._pre_roll.clear()
-        print(f"[recorder] episode {self._writer.episode_index:06d} started | task={self.task!r}")
+        print(f"[recorder] episode {new_writer.episode_index:06d} started | task={self.task!r}")
 
     def _finish_episode(self, status: str, success: Optional[bool]) -> Optional[Path]:
         if self._writer is None:
@@ -566,13 +843,28 @@ class RawEpisodeManager:
             for stream, count in current_drops.items()
             if int(count) - int(self._drop_baseline.get(stream, 0)) > 0
         }
-        output = self._writer.finalize(
-            status=status,
-            stop_trigger_monotonic_ns=self._stop_trigger_ns,
-            success=success,
-            ingress_drops=episode_drops,
-            abort_requested=self._abort_requested.is_set,
-        )
+        writer = self._writer
+        with self._camera_route_lock:
+            try:
+                output = writer.finalize(
+                    status=status,
+                    stop_trigger_monotonic_ns=self._stop_trigger_ns,
+                    success=success,
+                    ingress_drops=episode_drops,
+                    abort_requested=self._abort_requested.is_set,
+                )
+            except BaseException:
+                # An asynchronous camera failure is reported only after
+                # finalize safely exposes an interrupted episode. Clear that
+                # completed writer before propagating the fatal error.
+                if writer.closed:
+                    self._writer = None
+                    self._stop_trigger_ns = None
+                    self._finalize_deadline_ns = None
+                    self._drop_baseline = {}
+                    self._pre_roll.clear()
+                raise
+            self._writer = None
         manifest_status = status
         manifest_validation: Dict[str, Any] = {}
         try:
@@ -594,7 +886,6 @@ class RawEpisodeManager:
                 "failed_matching_event_requirements="
                 f"{manifest_validation.get('failed_matching_event_requirements', [])}"
             )
-        self._writer = None
         self._stop_trigger_ns = None
         self._finalize_deadline_ns = None
         self._drop_baseline = {}
@@ -602,6 +893,9 @@ class RawEpisodeManager:
         return output
 
     def handle_event(self, event: Dict[str, Any]) -> None:
+        if str(event.get("stream", "")) == "camera_head":
+            self.handle_camera_event(event)
+            return
         now_ns = event_monotonic_ns(event)
         with self._lock:
             is_controller = event.get("stream") == "controller"
@@ -635,6 +929,31 @@ class RawEpisodeManager:
             if is_controller:
                 self._prev_start = start_pressed
                 self._prev_stop = stop_pressed
+
+    def handle_camera_event(self, event: Dict[str, Any]) -> None:
+        """Route one camera frame without involving the state dispatcher.
+
+        Camera transport has its own ingress worker.  That worker calls this
+        method, which only performs episode/pre-roll routing while holding the
+        manager lock; :meth:`RawEpisodeWriter.write_event` then hands the JPEG
+        to its bounded asynchronous camera writer.  Keeping this entry point
+        separate makes it impossible for high-rate state JSON traffic in the
+        public dispatcher to coalesce camera frames before they reach the
+        episode writer.
+        """
+
+        if str(event.get("stream", "")) != "camera_head":
+            raise ValueError("handle_camera_event requires stream='camera_head'")
+        now_ns = event_monotonic_ns(event)
+        with self._camera_route_lock:
+            if self._writer is None:
+                self._evict_camera_pre_roll(now_ns)
+                self._camera_pre_roll.append(event)
+            else:
+                # This is a non-blocking enqueue into RawEpisodeWriter's
+                # dedicated camera thread; no image or JSON file I/O occurs
+                # while the manager lock is held here.
+                self._writer.write_event(event)
 
     def tick(self, now_ns: Optional[int] = None) -> None:
         with self._lock:

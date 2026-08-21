@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import queue
 import sys
 import threading
 import time
@@ -86,6 +87,49 @@ def _make_controller_callback_server() -> LowLatencyTeleopPoseZMQServer:
 
 
 class StartFreshFrameGateTest(unittest.TestCase):
+    def test_tap_stream_filter_skips_payload_before_sequence_assignment(self) -> None:
+        server = object.__new__(LowLatencyTeleopPoseZMQServer)
+        server.tap_accepting = True
+        server.tap_streams = frozenset({"controller", "reference"})
+        server.tap_queue = queue.Queue(maxsize=8)
+        server.tap_stats_lock = threading.Lock()
+        server.tap_next_seq = 0
+        server.tap_topic_next_seq = {}
+        server.tap_enqueued_count = 0
+        server.tap_queue_drop_count = 0
+
+        server._enqueue_tap("xr", {"ignored": True})
+        server._enqueue_tap("reference", {"kept": True})
+
+        self.assertEqual(server.tap_next_seq, 1)
+        self.assertEqual(server.tap_enqueued_count, 1)
+        topic, event = server.tap_queue.get_nowait()
+        self.assertEqual(topic, "reference")
+        self.assertEqual(event["tap_seq"], 0)
+        self.assertEqual(event["tap_topic_seq"], 0)
+        self.assertTrue(event["kept"])
+
+    def test_tap_topic_sequence_is_independent_across_interleaved_topics(self) -> None:
+        server = object.__new__(LowLatencyTeleopPoseZMQServer)
+        server.tap_accepting = True
+        server.tap_streams = None
+        server.tap_queue = queue.Queue(maxsize=8)
+        server.tap_stats_lock = threading.Lock()
+        server.tap_next_seq = 0
+        server.tap_topic_next_seq = {}
+        server.tap_enqueued_count = 0
+        server.tap_queue_drop_count = 0
+
+        server._enqueue_tap("reference", {"marker": 0})
+        server._enqueue_tap("controller", {"marker": 1})
+        server._enqueue_tap("reference", {"marker": 2})
+
+        events = [server.tap_queue.get_nowait()[1] for _ in range(3)]
+        self.assertEqual([event["tap_seq"] for event in events], [0, 1, 2])
+        self.assertEqual(
+            [event["tap_topic_seq"] for event in events], [0, 0, 1]
+        )
+
     def test_controller_extract_preserves_analog_hand_inputs(self) -> None:
         server = object.__new__(LowLatencyTeleopPoseZMQServer)
         server.last_controller_buttons = server._default_controller_buttons()
