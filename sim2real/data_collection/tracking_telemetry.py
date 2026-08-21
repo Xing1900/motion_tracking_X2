@@ -20,6 +20,7 @@ except ImportError:  # Direct execution from this directory.
 TRACKING_TELEMETRY_TOPIC = "tracking_telemetry"
 TRACKING_TELEMETRY_SCHEMA_VERSION = 1
 TRACKING_TELEMETRY_JOINT_COUNT = len(X2_TRACKING_JOINT_NAMES)
+REFERENCE_AGE_SPLIT_TOLERANCE_MS = 0.5
 UINT64_MAX = (1 << 64) - 1
 
 _VECTOR_DIMS = {
@@ -33,10 +34,24 @@ _VECTOR_DIMS = {
     "policy_action": TRACKING_TELEMETRY_JOINT_COUNT,
     "command_joint_position": TRACKING_TELEMETRY_JOINT_COUNT,
 }
+_REFERENCE_AGE_FIELDS = (
+    "reference_source_age_ms",
+    "reference_total_age_ms",
+    "reference_upstream_age_at_bridge_ms",
+    "reference_bridge_to_policy_age_ms",
+)
 
 
 class TrackingTelemetryProtocolError(ValueError):
     """Raised when a controller telemetry message violates the wire schema."""
+
+
+class TrackingTelemetryReferenceAgeError(TrackingTelemetryProtocolError):
+    """Raised when production telemetry lacks a self-consistent age split."""
+
+    def __init__(self, message: str, *, drop_reason: str) -> None:
+        super().__init__(message)
+        self.drop_reason = str(drop_reason)
 
 
 def _strict_int(payload: Dict[str, Any], key: str, *, minimum: int, maximum: int) -> int:
@@ -195,9 +210,16 @@ def parse_tracking_telemetry_parts(parts: Sequence[bytes]) -> Dict[str, Any]:
     # Added as optional provenance within schema v1 so new controller builds
     # can expose reference freshness without making older v1 recordings
     # unreadable.
-    normalized["reference_source_age_ms"] = _optional_finite_number(
-        payload, "reference_source_age_ms"
+    # ``reference_source_age_ms`` is the schema-v1 legacy name for total
+    # source-to-policy-consumption age.  New publishers keep that alias and
+    # additionally split it at the bridge reply boundary.  All additions stay
+    # optional within schema v1 so an old recording remains readable for
+    # explicit diagnostics instead of being misparsed as a new split sample.
+    normalized["reference_age_split_fields_present"] = all(
+        age_key in payload for age_key in _REFERENCE_AGE_FIELDS
     )
+    for age_key in _REFERENCE_AGE_FIELDS:
+        normalized[age_key] = _optional_finite_number(payload, age_key)
     normalized["reference_source_time_exact"] = _strict_bool(
         payload, "reference_source_time_exact"
     )
@@ -221,6 +243,80 @@ def parse_tracking_telemetry_parts(parts: Sequence[bytes]) -> Dict[str, Any]:
     # keep the monotonic stamp as provenance for same-host diagnostics.
     normalized["source_timestamp_ns"] = normalized["sample_wall_time_ns"]
     return normalized
+
+
+def require_reference_age_split(event: Dict[str, Any]) -> None:
+    """Require the additive schema-v1 split used by production recording.
+
+    The wire parser keeps these fields optional so old raw JSON remains
+    readable.  A live ``groot_n17`` recorder is stricter: admitting a legacy
+    total-only sample would make the offline 80 ms upstream gate ambiguous.
+    """
+
+    if event.get("reference_age_split_fields_present") is not True:
+        raise TrackingTelemetryReferenceAgeError(
+            "reference age split fields are absent (old controller wire contract)",
+            drop_reason="reference_age_split_missing",
+        )
+
+    values = [event.get(key) for key in _REFERENCE_AGE_FIELDS]
+    real_consumed_reference = (
+        event.get("vr_session_active") is True
+        and event.get("reference_is_transition") is False
+        and event.get("reference_is_padded") is False
+    )
+    if (
+        real_consumed_reference
+        and event.get("reference_source_time_exact") is not True
+    ):
+        raise TrackingTelemetryReferenceAgeError(
+            "active operator reference has no exact robot-local source stamp",
+            drop_reason="reference_age_split_missing",
+        )
+    numeric_values_required = real_consumed_reference
+    if all(value is None for value in values):
+        if numeric_values_required:
+            raise TrackingTelemetryReferenceAgeError(
+                "reference age split is null for an active exact operator reference",
+                drop_reason="reference_age_split_missing",
+            )
+        # A new controller deliberately publishes null values before VR has an
+        # exact operator source (and for synthesized transition/padding).  Key
+        # presence proves the wire contract without killing the idle recorder.
+        return
+    if any(value is None for value in values):
+        missing = [
+            key
+            for key, value in zip(_REFERENCE_AGE_FIELDS, values)
+            if value is None
+        ]
+        raise TrackingTelemetryReferenceAgeError(
+            "reference age split is partially null: " + ", ".join(missing),
+            drop_reason="reference_age_split_inconsistent",
+        )
+
+    legacy_total_ms = float(event["reference_source_age_ms"])
+    explicit_total_ms = float(event["reference_total_age_ms"])
+    upstream_ms = float(event["reference_upstream_age_at_bridge_ms"])
+    bridge_to_policy_ms = float(event["reference_bridge_to_policy_age_ms"])
+    if (
+        abs(legacy_total_ms - explicit_total_ms)
+        > REFERENCE_AGE_SPLIT_TOLERANCE_MS
+    ):
+        raise TrackingTelemetryReferenceAgeError(
+            "reference age total alias mismatch: "
+            f"legacy={legacy_total_ms:.6f} ms, explicit={explicit_total_ms:.6f} ms",
+            drop_reason="reference_age_split_inconsistent",
+        )
+    residual_ms = explicit_total_ms - upstream_ms - bridge_to_policy_ms
+    if abs(residual_ms) > REFERENCE_AGE_SPLIT_TOLERANCE_MS:
+        raise TrackingTelemetryReferenceAgeError(
+            "reference age split inconsistent: "
+            f"total={explicit_total_ms:.6f} ms, upstream={upstream_ms:.6f} ms, "
+            f"bridge_to_policy={bridge_to_policy_ms:.6f} ms, "
+            f"residual={residual_ms:.6f} ms",
+            drop_reason="reference_age_split_inconsistent",
+        )
 
 
 class TrackingTelemetrySequenceTracker:

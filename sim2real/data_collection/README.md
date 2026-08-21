@@ -39,7 +39,9 @@ lowest-load profile and stores exactly four logical streams:
   independent bounded camera dispatcher/writer;
 - `tracking_telemetry`: one atomic 25 Hz snapshot made by the C++ controller:
   measured q29/dq29, policy-consumed root/q29 reference, root angular velocity,
-  projected gravity, raw policy output and final q29 command;
+  projected gravity, raw policy output and final q29 command. Reference timing
+  keeps the legacy source-to-policy total age and also splits it into upstream
+  age at the bridge reply plus bridge-to-policy consumption age;
 - `hand_command`: latest accepted left/right grasp fractions and `active`
   validity from `/vr_hand_controller/status`;
 - `controller`: the A/X edges that delimit each episode.
@@ -102,6 +104,13 @@ and verify the listener with `ss -ltnp | grep 28707`. The controller thread
 only copies one fixed-size sample into a bounded queue; JSON/ZMQ work happens
 off the real-time path, and overload is represented by sequence gaps instead
 of control-loop blocking.
+
+The robot-local bridge response already carries
+`reference_source_monotonic_ns` for the selected GMR frame and
+`bridge_reply_monotonic_ns` for that reply. The controller uses those exact
+steady-clock stamps to publish `reference_upstream_age_at_bridge_ms`,
+`reference_bridge_to_policy_age_ms`, and `reference_total_age_ms`; the legacy
+`reference_source_age_ms` remains an alias of the total for schema-v1 readers.
 
 For the older ROS-state `vla` session, add:
 
@@ -212,6 +221,23 @@ output, not the recorder tap.
 ## 3. Run the raw recorder
 
 Recommended robot-local GR00T N1.7 form (all high-rate paths stay on loopback):
+
+For normal robot-241 sessions, use the wrapper so the fixed endpoints,
+provenance paths and bridge runtime values do not have to be copied by hand:
+
+```bash
+cd /digit/run/x2_vr_data_collection
+./run_groot_n17_recorder.sh "touch the red button with the left hand"
+```
+
+The wrapper waits up to 10 seconds for ports 28704, 28706 and 28707, then runs
+the full command below. Its only argument is the required quoted task
+description. If the bridge is started with a non-default height, GMR iteration
+count, or lookback, set the matching `X2_VR_HUMAN_HEIGHT`,
+`X2_VR_GMR_MAX_ITER`, or
+`X2_VR_LOOKBACK_MS` environment variable when starting the wrapper.
+
+The expanded command is retained here for non-standard layouts and debugging:
 
 ```bash
 source /opt/ros/humble/setup.bash
@@ -424,11 +450,35 @@ For `groot_n17` raw episodes, run the strict source-time converter as a dry run:
 It anchors each 25 Hz row to one unique camera frame, then causally takes the
 newest atomic C++ telemetry and latest active hand state at or before that
 exposure. Controller-generated transition and padded references are rejected;
-a fresh bridge fallback remains usable only while its consumed-reference
-source age is at most 80 ms. Camera/telemetry/hand age, reference source age,
-sequence gaps, skipped reasons and q-reference/command tracking RMSE are kept
-in the conversion report. Any rejected tick splits continuity, and fragments
-shorter than the 40-step (1.6 s) action horizon are not emitted.
+a fresh bridge fallback remains usable only while the selected upstream
+reference was at most 80 ms old when the bridge replied. The total
+source-to-policy age is diagnostic, not a freshness gate: the deliberate
+lookback and controller future queue can make it roughly 100--130 ms even when
+GMR selection is fresh. Camera/telemetry/hand age, both parts and the total
+reference age, sequence gaps, skipped reasons and q-reference/command tracking
+RMSE are kept in the conversion report. Any rejected tick splits continuity,
+and fragments shorter than the 40-step (1.6 s) action horizon are not emitted.
+
+Use `--max_reference_upstream_age_ms` to change the 80 ms upstream gate. The
+old `--max_reference_source_age_ms` option was removed because its total-age
+meaning cannot be safely reused as an upstream-age alias. Old raw schema-v1
+telemetry that has only `reference_source_age_ms` is still parsed and reported
+as `reference_upstream_age_missing_legacy`, but it is diagnostics-only: the
+converter will not silently treat total queueing age as upstream GMR age or
+emit it as production training data.
+
+Live `groot_n17` capture is stricter than the backward-compatible raw parser.
+The recorder requires the legacy total alias and all three split-contract keys
+to be present. A new controller may legitimately set all four values to null
+while VR is idle or while it is synthesizing a transition/padded reference;
+an active, exact operator reference must provide all four numeric values, which
+must agree within 0.5 ms. Missing keys, partial nulls, or inconsistent values
+are not written; the first one increments
+`tracking_telemetry_invalid` plus `reference_age_split_missing` or
+`reference_age_split_inconsistent` and terminates the recorder with a clear
+rebuild/restart error. An old controller therefore cannot start a seemingly
+usable production capture; if A was already pressed, that episode is preserved
+as interrupted rather than valid.
 
 The output row is 104-D state and 40-D consumed reference action. Raw telemetry
 keeps the global aligned reference; each output segment is rigidly rebased into
@@ -487,11 +537,16 @@ python convert_to_groot_n17.py \
   --fps 25
 ```
 
-This writes the 104-D state, 40-D episode-local absolute consumed-reference action, four
+This writes the 104-D state, 40-D episode-local absolute consumed-reference action, six
 synchronization diagnostics and a `conversion_report.json` containing skipped
 reasons, exact raw-to-output segment provenance, the shared capture contract
 (including recorder/artifact hashes and bridge effective parameters), and
 tracking RMSE. It also copies the X2 `modality.json` into `meta/`.
+
+The first four `sync.timing_ms` entries keep their previous order and meaning:
+camera-grid offset, telemetry age, hand age, and total consumed-reference age.
+The appended fifth and sixth entries are upstream age at the bridge and
+bridge-to-policy age, respectively.
 
 GR00T N1.7 currently consumes its LeRobot-v2 flavor. Convert the resulting v3
 dataset with the helper in

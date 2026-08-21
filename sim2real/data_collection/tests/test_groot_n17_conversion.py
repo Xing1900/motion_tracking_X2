@@ -17,6 +17,7 @@ from convert_to_groot_n17 import (  # noqa: E402
     SequenceAwarePreviousSeries,
     _capture_contract,
     _quat_wxyz_to_rot6d,
+    _reference_age_components,
     _telemetry_payload,
     _validate_modality_json,
     _validate_manifest,
@@ -27,6 +28,7 @@ from convert_to_groot_n17 import (  # noqa: E402
 from schema import (  # noqa: E402
     GROOT_N17_ACTION_NAMES,
     GROOT_N17_STATE_NAMES,
+    GROOT_N17_TIMING_NAMES,
     X2_TRACKING_JOINT_NAMES,
 )
 
@@ -85,6 +87,16 @@ class GrootN17ConversionTest(unittest.TestCase):
     def test_schema_dimensions(self):
         self.assertEqual(len(GROOT_N17_STATE_NAMES), 104)
         self.assertEqual(len(GROOT_N17_ACTION_NAMES), 40)
+        self.assertEqual(len(GROOT_N17_TIMING_NAMES), 6)
+        self.assertEqual(
+            GROOT_N17_TIMING_NAMES[:4],
+            [
+                "camera_grid_offset_signed_ms",
+                "tracking_telemetry_previous_age_ms",
+                "hand_command_previous_age_ms",
+                "consumed_reference_source_age_ms",
+            ],
+        )
 
     def test_manifest_requires_latest_hand_state_and_fixed_head(self):
         manifest = {
@@ -173,6 +185,52 @@ class GrootN17ConversionTest(unittest.TestCase):
         bad["projected_gravity"][1] = float("nan")
         self.assertIsNone(_telemetry_payload(bad))
 
+    def test_reference_age_split_uses_upstream_not_total_for_freshness(self):
+        event = {
+            "reference_source_age_ms": 120.0,
+            "reference_total_age_ms": 120.0,
+            "reference_upstream_age_at_bridge_ms": 20.0,
+            "reference_bridge_to_policy_age_ms": 100.0,
+        }
+        ages, status = _reference_age_components(event)
+        self.assertEqual(status, "ok")
+        self.assertEqual(
+            ages,
+            {"upstream_ms": 20.0, "total_ms": 120.0, "bridge_to_policy_ms": 100.0},
+        )
+
+        legacy = {"reference_source_age_ms": 120.0}
+        self.assertEqual(
+            _reference_age_components(legacy)[1],
+            "reference_upstream_age_missing_legacy",
+        )
+
+        alias_mismatch = dict(event, reference_total_age_ms=121.0)
+        self.assertEqual(
+            _reference_age_components(alias_mismatch)[1],
+            "reference_total_age_alias_mismatch",
+        )
+
+        split_mismatch = dict(event, reference_bridge_to_policy_age_ms=99.0)
+        self.assertEqual(
+            _reference_age_components(split_mismatch)[1],
+            "reference_age_split_inconsistent",
+        )
+
+        tolerance_boundary = dict(
+            event,
+            reference_total_age_ms=120.5,
+            reference_bridge_to_policy_age_ms=100.5,
+        )
+        self.assertEqual(_reference_age_components(tolerance_boundary)[1], "ok")
+
+        missing_bridge_component = dict(event)
+        del missing_bridge_component["reference_bridge_to_policy_age_ms"]
+        self.assertEqual(
+            _reference_age_components(missing_bridge_component)[1],
+            "reference_age_split_missing",
+        )
+
     def test_segment_requires_true_25hz_continuity(self):
         def sample(timestamp_ns):
             return GrootSample(
@@ -181,7 +239,7 @@ class GrootN17ConversionTest(unittest.TestCase):
                 image_path=Path("image.jpg"),
                 state=np.zeros(104, dtype=np.float32),
                 action=np.zeros(40, dtype=np.float32),
-                timing_ms=np.zeros(4, dtype=np.float32),
+                timing_ms=np.zeros(6, dtype=np.float32),
                 telemetry_sequence=timestamp_ns,
                 tracking_error_sq=0.0,
                 command_error_sq=0.0,
@@ -261,7 +319,7 @@ class GrootN17ConversionTest(unittest.TestCase):
                 image_path=Path("image.jpg"),
                 state=state,
                 action=action,
-                timing_ms=np.zeros(4, dtype=np.float32),
+                timing_ms=np.zeros(6, dtype=np.float32),
                 telemetry_sequence=0,
                 tracking_error_sq=0.0,
                 command_error_sq=0.0,
@@ -387,7 +445,12 @@ class GrootN17ConversionTest(unittest.TestCase):
                         "recorder_recv_wall_time_ns": camera_wall + 9_000_000,
                         "vr_user_enabled": True,
                         "vr_session_active": True,
-                        "reference_source_age_ms": 20.0,
+                        # The intentional future queue makes total age exceed
+                        # 80 ms, while the upstream/GMR selection is fresh.
+                        "reference_source_age_ms": 120.0,
+                        "reference_total_age_ms": 120.0,
+                        "reference_upstream_age_at_bridge_ms": 20.0,
+                        "reference_bridge_to_policy_age_ms": 100.0,
                         "reference_is_transition": False,
                         "reference_is_padded": False,
                         "reference_is_fallback": False,
@@ -425,10 +488,77 @@ class GrootN17ConversionTest(unittest.TestCase):
             first = converted.samples[0]
             self.assertEqual(first.state.shape, (104,))
             self.assertEqual(first.action.shape, (40,))
-            self.assertEqual(first.timing_ms.shape, (4,))
+            self.assertEqual(first.timing_ms.shape, (6,))
+            np.testing.assert_allclose(first.timing_ms[3:], [120.0, 20.0, 100.0])
             np.testing.assert_allclose(first.state[64:73], first.action[:9])
             np.testing.assert_allclose(first.state[73:102], first.action[9:38])
             np.testing.assert_allclose(first.action[38:40], [0.25, 0.75])
+
+            fresh_fallback = [
+                dict(event, reference_is_fallback=True)
+                for event in telemetry_events
+            ]
+            write_stream("tracking_telemetry", fresh_fallback)
+            fallback_accepted = build_episode_samples(episode)
+            self.assertEqual(len(fallback_accepted.samples), frame_count)
+
+            transition = [
+                dict(event, reference_is_transition=True)
+                for event in telemetry_events
+            ]
+            write_stream("tracking_telemetry", transition)
+            transition_rejected = build_episode_samples(episode)
+            self.assertEqual(len(transition_rejected.samples), 0)
+            self.assertEqual(
+                transition_rejected.skip_counts["reference_transition"],
+                frame_count,
+            )
+
+            padded = [
+                dict(event, reference_is_padded=True)
+                for event in telemetry_events
+            ]
+            write_stream("tracking_telemetry", padded)
+            padded_rejected = build_episode_samples(episode)
+            self.assertEqual(len(padded_rejected.samples), 0)
+            self.assertEqual(
+                padded_rejected.skip_counts["reference_padded"],
+                frame_count,
+            )
+
+            stale_upstream = [
+                dict(
+                    event,
+                    reference_is_fallback=True,
+                    reference_upstream_age_at_bridge_ms=90.0,
+                    reference_bridge_to_policy_age_ms=30.0,
+                )
+                for event in telemetry_events
+            ]
+            write_stream("tracking_telemetry", stale_upstream)
+            upstream_rejected = build_episode_samples(episode)
+            self.assertEqual(len(upstream_rejected.samples), 0)
+            self.assertEqual(
+                upstream_rejected.skip_counts["reference_upstream_stale"],
+                frame_count,
+            )
+
+            legacy_only = []
+            for event in telemetry_events:
+                legacy_event = dict(event)
+                legacy_event.pop("reference_total_age_ms")
+                legacy_event.pop("reference_upstream_age_at_bridge_ms")
+                legacy_event.pop("reference_bridge_to_policy_age_ms")
+                legacy_only.append(legacy_event)
+            write_stream("tracking_telemetry", legacy_only)
+            legacy_rejected = build_episode_samples(episode)
+            self.assertEqual(len(legacy_rejected.samples), 0)
+            self.assertEqual(
+                legacy_rejected.skip_counts[
+                    "reference_upstream_age_missing_legacy"
+                ],
+                frame_count,
+            )
 
             # A single missing 25 Hz telemetry publication would otherwise be
             # accepted at exactly the 50 ms age threshold. Reject only the

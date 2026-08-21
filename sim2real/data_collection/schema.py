@@ -234,7 +234,11 @@ GROOT_N17_TIMING_NAMES = [
     "camera_grid_offset_signed_ms",
     "tracking_telemetry_previous_age_ms",
     "hand_command_previous_age_ms",
+    # Preserve the original first four fields for already-written consumers.
     "consumed_reference_source_age_ms",
+    # Schema-v1 additive split of the total age above.
+    "reference_upstream_age_at_bridge_ms",
+    "reference_bridge_to_policy_age_ms",
 ]
 
 
@@ -246,4 +250,4 @@ assert len(OBSERVATION_STATE_NAMES) == 68
 assert len(TIMING_NAMES) == 5
 assert len(GROOT_N17_STATE_NAMES) == 104
 assert len(GROOT_N17_ACTION_NAMES) == 40
-assert len(GROOT_N17_TIMING_NAMES) == 4
+assert len(GROOT_N17_TIMING_NAMES) == 6

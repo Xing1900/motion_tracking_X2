@@ -43,8 +43,10 @@ try:
         TRACKING_TELEMETRY_SCHEMA_VERSION,
         TRACKING_TELEMETRY_TOPIC,
         TrackingTelemetryProtocolError,
+        TrackingTelemetryReferenceAgeError,
         TrackingTelemetrySequenceTracker,
         parse_tracking_telemetry_parts,
+        require_reference_age_split,
     )
 except ImportError:  # Direct execution from this directory.
     from camera_tap_client import CameraTapClient
@@ -64,8 +66,10 @@ except ImportError:  # Direct execution from this directory.
         TRACKING_TELEMETRY_SCHEMA_VERSION,
         TRACKING_TELEMETRY_TOPIC,
         TrackingTelemetryProtocolError,
+        TrackingTelemetryReferenceAgeError,
         TrackingTelemetrySequenceTracker,
         parse_tracking_telemetry_parts,
+        require_reference_age_split,
     )
 
 
@@ -1407,6 +1411,11 @@ def main() -> None:
             if args.record_profile == "groot_n17"
             else None
         ),
+        "tracking_telemetry_reference_age_semantics": (
+            "split_upstream_bridge_to_policy_with_legacy_total"
+            if args.record_profile == "groot_n17"
+            else None
+        ),
         "camera_topic": (
             None if args.disable_ros or args.camera_tap_addr else args.camera_topic
         ),
@@ -1670,6 +1679,25 @@ def main() -> None:
                     recv_monotonic_ns, recv_wall_time_ns = _message_receive_times()
                     try:
                         event = parse_tracking_telemetry_parts(parts)
+                    except TrackingTelemetryProtocolError as exc:
+                        ingress.note_drop("tracking_telemetry_invalid", 1)
+                        print(f"[recorder] invalid tracking telemetry: {exc}")
+                        continue
+                    try:
+                        require_reference_age_split(event)
+                    except TrackingTelemetryReferenceAgeError as exc:
+                        # Parsing remains backward compatible for offline old
+                        # raw inspection, but production capture must never
+                        # admit an ambiguous legacy total-only sample.
+                        ingress.note_drop("tracking_telemetry_invalid", 1)
+                        ingress.note_drop(exc.drop_reason, 1)
+                        print(f"[recorder] invalid tracking telemetry: {exc}")
+                        raise RuntimeError(
+                            "groot_n17 tracking telemetry reference-age contract "
+                            "is unavailable; rebuild/restart the C++ controller "
+                            "before recording"
+                        ) from exc
+                    try:
                         gap = tracking_sequence_tracker.observe(event)
                     except TrackingTelemetryProtocolError as exc:
                         ingress.note_drop("tracking_telemetry_invalid", 1)

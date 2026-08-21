@@ -51,8 +51,10 @@ from tracking_telemetry import (  # noqa: E402
     TRACKING_TELEMETRY_SCHEMA_VERSION,
     TRACKING_TELEMETRY_TOPIC,
     TrackingTelemetryProtocolError,
+    TrackingTelemetryReferenceAgeError,
     TrackingTelemetrySequenceTracker,
     parse_tracking_telemetry_parts,
+    require_reference_age_split,
 )
 from x2_vr_recorder import (  # noqa: E402
     CameraIngressDispatcher,
@@ -141,6 +143,9 @@ def tracking_telemetry_payload(sequence: int = 0):
         "policy_action": q,
         "command_joint_position": q,
         "reference_source_age_ms": 12.5,
+        "reference_total_age_ms": 12.5,
+        "reference_upstream_age_at_bridge_ms": 2.5,
+        "reference_bridge_to_policy_age_ms": 10.0,
         "reference_source_time_exact": True,
         "reference_source_frame_sequence": sequence,
         "reference_is_transition": False,
@@ -1522,6 +1527,11 @@ class TrackingTelemetryProtocolTest(unittest.TestCase):
         self.assertEqual(event["sensor_generation"], 1017)
         self.assertEqual(event["source_timestamp_ns"], payload["sample_wall_time_ns"])
         self.assertEqual(len(event["reference_joint_position"]), 29)
+        self.assertEqual(event["reference_source_age_ms"], 12.5)
+        self.assertEqual(event["reference_total_age_ms"], 12.5)
+        self.assertEqual(event["reference_upstream_age_at_bridge_ms"], 2.5)
+        self.assertEqual(event["reference_bridge_to_policy_age_ms"], 10.0)
+        self.assertTrue(event["reference_age_split_fields_present"])
         self.assertTrue(
             all(isinstance(value, float) for value in event["policy_action"])
         )
@@ -1556,6 +1566,10 @@ class TrackingTelemetryProtocolTest(unittest.TestCase):
         nonfinite_optional["reference_source_age_ms"] = float("inf")
         invalid_cases.append(self._parts(nonfinite_optional))
 
+        negative_split_age = tracking_telemetry_payload()
+        negative_split_age["reference_upstream_age_at_bridge_ms"] = -0.1
+        invalid_cases.append(self._parts(negative_split_age))
+
         invalid_optional_flag = tracking_telemetry_payload()
         invalid_optional_flag["reference_is_fallback"] = 1
         invalid_cases.append(self._parts(invalid_optional_flag))
@@ -1571,6 +1585,90 @@ class TrackingTelemetryProtocolTest(unittest.TestCase):
             with self.subTest(parts=parts[0]):
                 with self.assertRaises(TrackingTelemetryProtocolError):
                     parse_tracking_telemetry_parts(parts)
+
+    def test_reference_age_split_is_additive_schema_v1_and_legacy_is_readable(self):
+        legacy = tracking_telemetry_payload()
+        for key in (
+            "reference_total_age_ms",
+            "reference_upstream_age_at_bridge_ms",
+            "reference_bridge_to_policy_age_ms",
+        ):
+            del legacy[key]
+
+        event = parse_tracking_telemetry_parts(self._parts(legacy))
+
+        self.assertEqual(event["reference_source_age_ms"], 12.5)
+        self.assertIsNone(event["reference_total_age_ms"])
+        self.assertIsNone(event["reference_upstream_age_at_bridge_ms"])
+        self.assertIsNone(event["reference_bridge_to_policy_age_ms"])
+        self.assertFalse(event["reference_age_split_fields_present"])
+        with self.assertRaises(TrackingTelemetryReferenceAgeError) as caught:
+            require_reference_age_split(event)
+        self.assertEqual(caught.exception.drop_reason, "reference_age_split_missing")
+
+    def test_live_reference_age_split_requires_alias_and_consistent_sum(self):
+        valid = parse_tracking_telemetry_parts(
+            self._parts(tracking_telemetry_payload())
+        )
+        require_reference_age_split(valid)
+
+        idle = tracking_telemetry_payload()
+        idle["vr_user_enabled"] = False
+        idle["vr_session_active"] = False
+        idle["reference_source_time_exact"] = False
+        for key in (
+            "reference_source_age_ms",
+            "reference_total_age_ms",
+            "reference_upstream_age_at_bridge_ms",
+            "reference_bridge_to_policy_age_ms",
+        ):
+            idle[key] = None
+        require_reference_age_split(
+            parse_tracking_telemetry_parts(self._parts(idle))
+        )
+
+        active_null = dict(idle)
+        active_null["vr_session_active"] = True
+        with self.assertRaises(TrackingTelemetryReferenceAgeError) as caught:
+            require_reference_age_split(
+                parse_tracking_telemetry_parts(self._parts(active_null))
+            )
+        self.assertEqual(caught.exception.drop_reason, "reference_age_split_missing")
+
+        active_null["reference_source_time_exact"] = True
+        with self.assertRaises(TrackingTelemetryReferenceAgeError) as caught:
+            require_reference_age_split(
+                parse_tracking_telemetry_parts(self._parts(active_null))
+            )
+        self.assertEqual(caught.exception.drop_reason, "reference_age_split_missing")
+
+        transition_null = dict(active_null)
+        transition_null["reference_is_transition"] = True
+        require_reference_age_split(
+            parse_tracking_telemetry_parts(self._parts(transition_null))
+        )
+
+        alias_mismatch = tracking_telemetry_payload()
+        alias_mismatch["reference_total_age_ms"] = 13.1
+        with self.assertRaises(TrackingTelemetryReferenceAgeError) as caught:
+            require_reference_age_split(
+                parse_tracking_telemetry_parts(self._parts(alias_mismatch))
+            )
+        self.assertEqual(
+            caught.exception.drop_reason,
+            "reference_age_split_inconsistent",
+        )
+
+        split_mismatch = tracking_telemetry_payload()
+        split_mismatch["reference_bridge_to_policy_age_ms"] = 9.0
+        with self.assertRaises(TrackingTelemetryReferenceAgeError) as caught:
+            require_reference_age_split(
+                parse_tracking_telemetry_parts(self._parts(split_mismatch))
+            )
+        self.assertEqual(
+            caught.exception.drop_reason,
+            "reference_age_split_inconsistent",
+        )
 
     def test_sensor_generation_is_optional_and_accepts_legacy_unavailable(self):
         for unavailable in (None, -1):

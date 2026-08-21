@@ -64,9 +64,10 @@ except ImportError:  # Direct execution from this directory.
     from synchronization import TIME_BASIS_SOURCE, TimedStream
 
 
-CONVERSION_REPORT_SCHEMA_VERSION = "x2-groot-n17-conversion-v1"
+CONVERSION_REPORT_SCHEMA_VERSION = "x2-groot-n17-conversion-v2"
 EXPECTED_RECORD_PROFILE = "groot_n17"
 EXPECTED_TELEMETRY_SCHEMA_VERSION = 1
+REFERENCE_AGE_SPLIT_TOLERANCE_MS = 0.5
 REQUIRED_CAPTURE_PROVENANCE = {
     "recorder",
     "controller_binary",
@@ -123,6 +124,7 @@ class GrootEpisode:
     skip_counts: Dict[str, int]
     synchronization_diagnostics: Dict[str, Dict[str, Any]]
     telemetry_sequence_gaps: int
+    reference_age_diagnostics: Dict[str, Any]
 
 
 def _validate_modality_json(path: Path) -> str:
@@ -188,6 +190,9 @@ def _capture_contract(manifest: Dict[str, Any], episode_dir: Path) -> Dict[str, 
         ),
         "tracking_telemetry_delivery_semantics": source_config.get(
             "tracking_telemetry_delivery_semantics"
+        ),
+        "tracking_telemetry_reference_age_semantics": source_config.get(
+            "tracking_telemetry_reference_age_semantics"
         ),
         "hand_status_delivery_semantics": source_config.get(
             "hand_status_delivery_semantics"
@@ -383,6 +388,147 @@ def _telemetry_payload(event: Dict[str, Any]) -> Optional[Dict[str, np.ndarray]]
     return {key: value for key, value in values.items() if value is not None}
 
 
+def _nonnegative_finite_age(event: Dict[str, Any], key: str) -> Optional[float]:
+    """Return one optional age without accepting bools, NaN or negatives."""
+
+    value = event.get(key)
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        age_ms = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(age_ms) or age_ms < 0.0:
+        return None
+    return age_ms
+
+
+def _reference_age_components(
+    event: Dict[str, Any],
+) -> tuple[Optional[Dict[str, float]], str]:
+    """Resolve the additive schema-v1 reference-age split.
+
+    ``reference_source_age_ms`` is retained on the wire as the legacy total
+    source-to-policy age.  It must never be used as the 80 ms upstream/GMR
+    freshness gate: the controller intentionally consumes a frame several
+    future-buffer steps after the bridge selected it.  New telemetry exposes
+    both sides of the bridge-reply boundary so those meanings stay separate.
+    """
+
+    legacy_total_ms = _nonnegative_finite_age(event, "reference_source_age_ms")
+    explicit_total_ms = _nonnegative_finite_age(event, "reference_total_age_ms")
+    upstream_ms = _nonnegative_finite_age(
+        event, "reference_upstream_age_at_bridge_ms"
+    )
+    bridge_to_policy_ms = _nonnegative_finite_age(
+        event, "reference_bridge_to_policy_age_ms"
+    )
+    if legacy_total_ms is None and explicit_total_ms is None:
+        return None, "reference_total_age_missing"
+    if upstream_ms is None or bridge_to_policy_ms is None:
+        if legacy_total_ms is not None and explicit_total_ms is None:
+            # This is the expected signature of an old raw schema-v1 event.
+            return None, "reference_upstream_age_missing_legacy"
+        return None, "reference_age_split_missing"
+    if legacy_total_ms is None or explicit_total_ms is None:
+        return None, "reference_total_age_alias_missing"
+    if (
+        abs(legacy_total_ms - explicit_total_ms)
+        > REFERENCE_AGE_SPLIT_TOLERANCE_MS
+    ):
+        return None, "reference_total_age_alias_mismatch"
+
+    total_ms = explicit_total_ms
+    if (
+        abs(total_ms - upstream_ms - bridge_to_policy_ms)
+        > REFERENCE_AGE_SPLIT_TOLERANCE_MS
+    ):
+        return None, "reference_age_split_inconsistent"
+    return {
+        "upstream_ms": upstream_ms,
+        "total_ms": total_ms,
+        "bridge_to_policy_ms": bridge_to_policy_ms,
+    }, "ok"
+
+
+def _numeric_summary(values: Sequence[float]) -> Dict[str, Any]:
+    finite = np.asarray(
+        [float(value) for value in values if math.isfinite(float(value))],
+        dtype=np.float64,
+    )
+    if finite.size == 0:
+        return {
+            "count": 0,
+            "min": None,
+            "p50": None,
+            "p95": None,
+            "p99": None,
+            "max": None,
+        }
+    return {
+        "count": int(finite.size),
+        "min": float(np.min(finite)),
+        "p50": float(np.percentile(finite, 50)),
+        "p95": float(np.percentile(finite, 95)),
+        "p99": float(np.percentile(finite, 99)),
+        "max": float(np.max(finite)),
+    }
+
+
+def _reference_age_diagnostics(
+    events: Sequence[Dict[str, Any]], *, max_upstream_age_ms: float
+) -> Dict[str, Any]:
+    legacy_total: list[float] = []
+    explicit_total: list[float] = []
+    upstream: list[float] = []
+    bridge_to_policy: list[float] = []
+    split_residual: list[float] = []
+    complete_split_count = 0
+    legacy_only_count = 0
+    upstream_over_limit_count = 0
+    for event in events:
+        legacy = _nonnegative_finite_age(event, "reference_source_age_ms")
+        total = _nonnegative_finite_age(event, "reference_total_age_ms")
+        upstream_age = _nonnegative_finite_age(
+            event, "reference_upstream_age_at_bridge_ms"
+        )
+        queue_age = _nonnegative_finite_age(
+            event, "reference_bridge_to_policy_age_ms"
+        )
+        if legacy is not None:
+            legacy_total.append(legacy)
+        if total is not None:
+            explicit_total.append(total)
+        if upstream_age is not None:
+            upstream.append(upstream_age)
+            if upstream_age > max_upstream_age_ms:
+                upstream_over_limit_count += 1
+        if queue_age is not None:
+            bridge_to_policy.append(queue_age)
+        if legacy is not None and upstream_age is None:
+            legacy_only_count += 1
+        resolved_total = total if total is not None else legacy
+        if (
+            resolved_total is not None
+            and upstream_age is not None
+            and queue_age is not None
+        ):
+            complete_split_count += 1
+            split_residual.append(resolved_total - upstream_age - queue_age)
+    return {
+        "input_events": len(events),
+        "complete_split_events": complete_split_count,
+        "legacy_total_only_events": legacy_only_count,
+        "upstream_over_limit_events": upstream_over_limit_count,
+        "upstream_limit_ms": float(max_upstream_age_ms),
+        "legacy_total_consumed_age_ms": _numeric_summary(legacy_total),
+        "explicit_total_consumed_age_ms": _numeric_summary(explicit_total),
+        "upstream_age_at_bridge_ms": _numeric_summary(upstream),
+        "bridge_to_policy_age_ms": _numeric_summary(bridge_to_policy),
+        "split_residual_ms": _numeric_summary(split_residual),
+    }
+
+
 def _hand_payload(event: Dict[str, Any]) -> Optional[np.ndarray]:
     if event.get("active") is not True:
         return None
@@ -486,7 +632,7 @@ def build_episode_samples(
     max_camera_grid_offset_ms: float = 30.0,
     max_tracking_age_ms: float = 50.0,
     max_hand_age_ms: float = 40.0,
-    max_reference_source_age_ms: float = 80.0,
+    max_reference_upstream_age_ms: float = 80.0,
 ) -> GrootEpisode:
     manifest = _load_manifest(episode_dir)
     _validate_manifest(manifest, episode_dir)
@@ -521,6 +667,15 @@ def build_episode_samples(
         if start_ns <= _series_time_ns(event) <= stop_ns
     ]
     camera_times = [_series_time_ns(event) for event in camera_events]
+    active_telemetry_events = [
+        event
+        for event in streams["tracking_telemetry"].events
+        if start_ns <= _series_time_ns(event) <= stop_ns
+    ]
+    reference_age_diagnostics = _reference_age_diagnostics(
+        active_telemetry_events,
+        max_upstream_age_ms=max_reference_upstream_age_ms,
+    )
     telemetry = SequenceAwarePreviousSeries(
         streams["tracking_telemetry"].events,
         sequence_modulus=1 << 64,
@@ -599,19 +754,20 @@ def build_episode_samples(
             # separately and remains eligible under the source-age gate.
             skips["reference_padded"] += 1
             continue
-        try:
-            reference_source_age_ms = float(
-                telemetry_event["reference_source_age_ms"]
-            )
-        except (KeyError, TypeError, ValueError):
-            skips["reference_source_age_missing"] += 1
+        reference_ages, reference_age_status = _reference_age_components(
+            telemetry_event
+        )
+        if reference_age_status != "ok":
+            skips[reference_age_status] += 1
             continue
-        if (
-            not math.isfinite(reference_source_age_ms)
-            or reference_source_age_ms < 0.0
-            or reference_source_age_ms > max_reference_source_age_ms
-        ):
-            skips["reference_source_stale"] += 1
+        assert reference_ages is not None
+        reference_upstream_age_ms = reference_ages["upstream_ms"]
+        reference_total_age_ms = reference_ages["total_ms"]
+        reference_bridge_to_policy_age_ms = reference_ages[
+            "bridge_to_policy_ms"
+        ]
+        if reference_upstream_age_ms > max_reference_upstream_age_ms:
+            skips["reference_upstream_stale"] += 1
             continue
 
         hand_event, hand_age_ms, hand_status = hands.previous(camera_time)
@@ -679,7 +835,9 @@ def build_episode_samples(
                         camera_offset_ms,
                         tracking_age_ms,
                         hand_age_ms,
-                        reference_source_age_ms,
+                        reference_total_age_ms,
+                        reference_upstream_age_ms,
+                        reference_bridge_to_policy_age_ms,
                     ],
                     dtype=np.float32,
                 ),
@@ -700,6 +858,7 @@ def build_episode_samples(
         skip_counts=dict(skips),
         synchronization_diagnostics=_sync_diagnostics(streams),
         telemetry_sequence_gaps=_telemetry_gap_count(streams["tracking_telemetry"].events),
+        reference_age_diagnostics=reference_age_diagnostics,
     )
 
 
@@ -828,6 +987,7 @@ def _report(
                 "skip_counts": episode.skip_counts,
                 "telemetry_sequence_gaps": episode.telemetry_sequence_gaps,
                 "synchronization_diagnostics": episode.synchronization_diagnostics,
+                "reference_age_diagnostics": episode.reference_age_diagnostics,
                 "manifest_status": manifest.get("status"),
                 "success": manifest.get("success"),
                 "validation": manifest.get("validation"),
@@ -863,12 +1023,15 @@ def _report(
             "camera_rotation_deg": args.camera_rotation_deg,
             "minimum_segment_frames": args.min_segment_frames,
             "require_success": bool(args.require_success),
+            "timing_names": GROOT_N17_TIMING_NAMES,
         },
         "thresholds_ms": {
             "camera_grid_offset": args.max_camera_grid_offset_ms,
             "tracking_telemetry": args.max_tracking_age_ms,
             "hand_command": args.max_hand_age_ms,
-            "consumed_reference_source": args.max_reference_source_age_ms,
+            "reference_upstream_age_at_bridge": (
+                args.max_reference_upstream_age_ms
+            ),
         },
         "summary": {
             "candidate_ticks": sum(episode.candidate_count for episode in episodes),
@@ -881,6 +1044,15 @@ def _report(
             ),
             "command_tracking_rmse_rad": math.sqrt(
                 float(np.mean([sample.command_error_sq for sample in all_samples]))
+            ),
+            "accepted_reference_total_consumed_age_ms": _numeric_summary(
+                [float(sample.timing_ms[3]) for sample in all_samples]
+            ),
+            "accepted_reference_upstream_age_at_bridge_ms": _numeric_summary(
+                [float(sample.timing_ms[4]) for sample in all_samples]
+            ),
+            "accepted_reference_bridge_to_policy_age_ms": _numeric_summary(
+                [float(sample.timing_ms[5]) for sample in all_samples]
             ),
         },
         "raw_episodes": raw_episode_records,
@@ -897,7 +1069,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_camera_grid_offset_ms", type=float, default=30.0)
     parser.add_argument("--max_tracking_age_ms", type=float, default=50.0)
     parser.add_argument("--max_hand_age_ms", type=float, default=40.0)
-    parser.add_argument("--max_reference_source_age_ms", type=float, default=80.0)
+    parser.add_argument(
+        "--max_reference_upstream_age_ms",
+        type=float,
+        default=80.0,
+        help=(
+            "Maximum selected-reference age at the bridge reply boundary; "
+            "total controller-consumption age is diagnostic only."
+        ),
+    )
     parser.add_argument("--min_segment_frames", type=int, default=40)
     parser.add_argument("--camera_rotation_deg", type=int, choices=(0, 180), default=180)
     parser.add_argument("--require_success", action="store_true")
@@ -918,7 +1098,7 @@ def main() -> None:
         args.max_camera_grid_offset_ms,
         args.max_tracking_age_ms,
         args.max_hand_age_ms,
-        args.max_reference_source_age_ms,
+        args.max_reference_upstream_age_ms,
     ) <= 0.0:
         raise ValueError("all synchronization thresholds must be positive")
 
@@ -951,7 +1131,7 @@ def main() -> None:
             max_camera_grid_offset_ms=args.max_camera_grid_offset_ms,
             max_tracking_age_ms=args.max_tracking_age_ms,
             max_hand_age_ms=args.max_hand_age_ms,
-            max_reference_source_age_ms=args.max_reference_source_age_ms,
+            max_reference_upstream_age_ms=args.max_reference_upstream_age_ms,
         )
         for episode_dir in episode_dirs
     ]
@@ -959,7 +1139,8 @@ def main() -> None:
         print(
             f"[groot] {episode.episode_dir.name}: accepted={len(episode.samples)}/"
             f"{episode.candidate_count}, skipped={episode.skip_counts}, "
-            f"telemetry_sequence_gaps={episode.telemetry_sequence_gaps}"
+            f"telemetry_sequence_gaps={episode.telemetry_sequence_gaps}, "
+            f"reference_age={episode.reference_age_diagnostics}"
         )
 
     output_segments: list[tuple[GrootEpisode, list[GrootSample]]] = []
@@ -973,6 +1154,17 @@ def main() -> None:
             localize_segment_root_references(segment)
         short_frames += dropped
     if not output_segments:
+        if any(
+            episode.skip_counts.get("reference_upstream_age_missing_legacy", 0)
+            for episode in converted
+        ):
+            raise RuntimeError(
+                "No production segment: this raw telemetry has only the legacy "
+                "total consumed-reference age. It remains readable for the "
+                "printed diagnostics, but requires a controller build that "
+                "records reference_upstream_age_at_bridge_ms and "
+                "reference_bridge_to_policy_age_ms before training conversion."
+            )
         raise RuntimeError("No continuous segment is long enough for the 40-step action horizon")
 
     image_shape = _validate_images(output_segments, args.camera_rotation_deg)
