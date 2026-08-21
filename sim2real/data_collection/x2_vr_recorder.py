@@ -35,6 +35,7 @@ try:
     )
     from .schema import (
         BRIDGE_RUNTIME_EFFECTIVE_PARAM_NAMES,
+        REFERENCE_DIAGNOSTICS_SCHEMA_VERSION,
         TELEOP_TAP_SCHEMA_VERSION,
         X2_TRACKING_JOINT_NAMES,
         normalize_bridge_runtime_effective_params,
@@ -44,9 +45,11 @@ try:
         TRACKING_TELEMETRY_TOPIC,
         TrackingTelemetryProtocolError,
         TrackingTelemetryReferenceAgeError,
+        TrackingTelemetryReferenceDiagnosticsError,
         TrackingTelemetrySequenceTracker,
         parse_tracking_telemetry_parts,
         require_reference_age_split,
+        require_reference_diagnostics_contract,
     )
 except ImportError:  # Direct execution from this directory.
     from camera_tap_client import CameraTapClient
@@ -58,6 +61,7 @@ except ImportError:  # Direct execution from this directory.
     )
     from schema import (
         BRIDGE_RUNTIME_EFFECTIVE_PARAM_NAMES,
+        REFERENCE_DIAGNOSTICS_SCHEMA_VERSION,
         TELEOP_TAP_SCHEMA_VERSION,
         X2_TRACKING_JOINT_NAMES,
         normalize_bridge_runtime_effective_params,
@@ -67,9 +71,11 @@ except ImportError:  # Direct execution from this directory.
         TRACKING_TELEMETRY_TOPIC,
         TrackingTelemetryProtocolError,
         TrackingTelemetryReferenceAgeError,
+        TrackingTelemetryReferenceDiagnosticsError,
         TrackingTelemetrySequenceTracker,
         parse_tracking_telemetry_parts,
         require_reference_age_split,
+        require_reference_diagnostics_contract,
     )
 
 
@@ -1416,6 +1422,16 @@ def main() -> None:
             if args.record_profile == "groot_n17"
             else None
         ),
+        "tracking_telemetry_reference_diagnostics_schema_version": (
+            REFERENCE_DIAGNOSTICS_SCHEMA_VERSION
+            if args.record_profile == "groot_n17"
+            else None
+        ),
+        "tracking_telemetry_reference_diagnostics_semantics": (
+            "bridge_gmr_root_cause_v1"
+            if args.record_profile == "groot_n17"
+            else None
+        ),
         "camera_topic": (
             None if args.disable_ros or args.camera_tap_addr else args.camera_topic
         ),
@@ -1683,6 +1699,22 @@ def main() -> None:
                         ingress.note_drop("tracking_telemetry_invalid", 1)
                         print(f"[recorder] invalid tracking telemetry: {exc}")
                         continue
+                    try:
+                        require_reference_diagnostics_contract(event)
+                    except TrackingTelemetryReferenceDiagnosticsError as exc:
+                        # The raw parser accepts older schema-v1 recordings,
+                        # but new production capture must prove that its C++
+                        # publisher and active bridge expose the diagnostic-v1
+                        # contract. Diagnostic values themselves remain
+                        # nullable and never alter the training freshness gate.
+                        ingress.note_drop("tracking_telemetry_invalid", 1)
+                        ingress.note_drop(exc.drop_reason, 1)
+                        print(f"[recorder] invalid tracking telemetry: {exc}")
+                        raise RuntimeError(
+                            "groot_n17 tracking telemetry bridge/GMR diagnostics "
+                            "contract is unavailable; deploy/restart both the "
+                            "instrumented bridge and C++ controller before recording"
+                        ) from exc
                     try:
                         require_reference_age_split(event)
                     except TrackingTelemetryReferenceAgeError as exc:

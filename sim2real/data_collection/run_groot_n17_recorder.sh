@@ -20,7 +20,7 @@ Optional environment overrides:
   X2_VR_OUTPUT_ROOT                  default: /digit/run/Datasets/x2_vr/raw
   X2_VR_HUMAN_HEIGHT                 default: 1.7
   X2_VR_GMR_MAX_ITER                 default: 0
-  X2_VR_LOOKBACK_MS                  default: 25.0
+  X2_VR_LOOKBACK_MS                  default: 35.0
   X2_VR_PORT_WAIT_TIMEOUT_S          default: 10
   X2_VR_SKIP_PORT_PREFLIGHT          set to 1 only for diagnostics
 EOF
@@ -55,7 +55,7 @@ python_bin="${X2_VR_PYTHON:-${bridge_root}/.venv/bin/python}"
 output_root="${X2_VR_OUTPUT_ROOT:-/digit/run/Datasets/x2_vr/raw}"
 human_height="${X2_VR_HUMAN_HEIGHT:-1.7}"
 gmr_max_iter="${X2_VR_GMR_MAX_ITER:-0}"
-lookback_ms="${X2_VR_LOOKBACK_MS:-25.0}"
+lookback_ms="${X2_VR_LOOKBACK_MS:-35.0}"
 port_wait_timeout_s="${X2_VR_PORT_WAIT_TIMEOUT_S:-10}"
 if [[ ! "${port_wait_timeout_s}" =~ ^[1-9][0-9]*$ ]]; then
   echo "error: X2_VR_PORT_WAIT_TIMEOUT_S must be a positive integer" >&2

@@ -41,6 +41,8 @@ try:
         GROOT_N17_STATE_NAMES,
         GROOT_N17_TIMING_NAMES,
         RAW_DATASET_SCHEMA_VERSION,
+        REFERENCE_DIAGNOSTIC_FIELD_NAMES,
+        REFERENCE_DIAGNOSTICS_SCHEMA_VERSION,
         X2_TRACKING_JOINT_NAMES,
         normalize_bridge_runtime_effective_params,
     )
@@ -58,13 +60,15 @@ except ImportError:  # Direct execution from this directory.
         GROOT_N17_STATE_NAMES,
         GROOT_N17_TIMING_NAMES,
         RAW_DATASET_SCHEMA_VERSION,
+        REFERENCE_DIAGNOSTIC_FIELD_NAMES,
+        REFERENCE_DIAGNOSTICS_SCHEMA_VERSION,
         X2_TRACKING_JOINT_NAMES,
         normalize_bridge_runtime_effective_params,
     )
     from synchronization import TIME_BASIS_SOURCE, TimedStream
 
 
-CONVERSION_REPORT_SCHEMA_VERSION = "x2-groot-n17-conversion-v2"
+CONVERSION_REPORT_SCHEMA_VERSION = "x2-groot-n17-conversion-v3"
 EXPECTED_RECORD_PROFILE = "groot_n17"
 EXPECTED_TELEMETRY_SCHEMA_VERSION = 1
 REFERENCE_AGE_SPLIT_TOLERANCE_MS = 0.5
@@ -125,6 +129,7 @@ class GrootEpisode:
     synchronization_diagnostics: Dict[str, Dict[str, Any]]
     telemetry_sequence_gaps: int
     reference_age_diagnostics: Dict[str, Any]
+    reference_pipeline_diagnostics: Dict[str, Any]
 
 
 def _validate_modality_json(path: Path) -> str:
@@ -193,6 +198,14 @@ def _capture_contract(manifest: Dict[str, Any], episode_dir: Path) -> Dict[str, 
         ),
         "tracking_telemetry_reference_age_semantics": source_config.get(
             "tracking_telemetry_reference_age_semantics"
+        ),
+        "tracking_telemetry_reference_diagnostics_schema_version": (
+            source_config.get(
+                "tracking_telemetry_reference_diagnostics_schema_version"
+            )
+        ),
+        "tracking_telemetry_reference_diagnostics_semantics": source_config.get(
+            "tracking_telemetry_reference_diagnostics_semantics"
         ),
         "hand_status_delivery_semantics": source_config.get(
             "hand_status_delivery_semantics"
@@ -529,6 +542,267 @@ def _reference_age_diagnostics(
     }
 
 
+_REFERENCE_PIPELINE_NUMERIC_FIELDS = (
+    "latest_raw_motion_age_at_bridge_ms",
+    "latest_retarget_age_at_bridge_ms",
+    "bridge_request_to_reply_us",
+    "latest_retarget_worker_queue_us",
+    "latest_retarget_worker_compute_us",
+    "latest_retarget_dropped_before_process",
+    "reference_support_worker_queue_us",
+    "reference_support_worker_compute_us",
+    "reference_support_dropped_before_process",
+)
+
+
+def _optional_nonnegative_integer(
+    event: Dict[str, Any], key: str, *, minimum: int = 0
+) -> Optional[int]:
+    value = event.get(key)
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+        return None
+    return int(value)
+
+
+def _reference_pipeline_diagnostics(
+    events: Sequence[Dict[str, Any]], *, max_upstream_age_ms: float
+) -> Dict[str, Any]:
+    """Summarize bridge/GMR provenance without changing training acceptance.
+
+    Root-cause labels are intentionally conservative. A stale raw-motion age
+    proves the bridge has no fresh body input. Fresh raw motion paired with a
+    stale latest retarget proves lag on the GMR/output side. If both latest
+    streams are fresh but the selected support is old, selection/lookback is
+    isolated. Missing diagnostics remain ``unknown``; they never weaken the
+    existing upstream-age gate.
+    """
+
+    structural_missing: Counter[str] = Counter()
+    null_values: Counter[str] = Counter()
+    all_modes: Counter[str] = Counter()
+    active_modes: Counter[str] = Counter()
+    stale_modes: Counter[str] = Counter()
+    numeric: Dict[str, list[float]] = {
+        key: [] for key in _REFERENCE_PIPELINE_NUMERIC_FIELDS
+    }
+    stale_numeric: Dict[str, list[float]] = {
+        key: [] for key in _REFERENCE_PIPELINE_NUMERIC_FIELDS
+    }
+    latest_raw_to_retarget_sequence_lag: list[float] = []
+    latest_retarget_to_support_sequence_lag: list[float] = []
+    latest_raw_to_support_sequence_lag: list[float] = []
+    latest_worker_total_us: list[float] = []
+    support_worker_total_us: list[float] = []
+    root_causes: Counter[str] = Counter()
+    fields_present_count = 0
+    schema_v1_count = 0
+    active_real_count = 0
+    active_real_schema_v1_count = 0
+    eligible_operator_count = 0
+    upstream_fresh_count = 0
+    upstream_stale_count = 0
+    stale_fallback_count = 0
+    stale_latest_drop_positive_count = 0
+    stale_support_drop_positive_count = 0
+    inconsistent_sequence_lag_count = 0
+
+    for event in events:
+        fields_marker_available = "reference_diagnostics_fields_present" in event
+        if fields_marker_available:
+            # The live parser normalizes every optional diagnostic key to
+            # ``None`` for legacy payloads, while retaining this marker to say
+            # that the keys were absent on the wire.  Never reinterpret those
+            # normalized nulls as a complete capture contract.
+            fields_present = (
+                event.get("reference_diagnostics_fields_present") is True
+            )
+        else:
+            # Raw JSONL written before the marker existed is still inspectable.
+            fields_present = all(
+                key in event for key in REFERENCE_DIAGNOSTIC_FIELD_NAMES
+            )
+        if fields_present:
+            fields_present_count += 1
+        for key in REFERENCE_DIAGNOSTIC_FIELD_NAMES:
+            if (
+                fields_marker_available
+                and event.get("reference_diagnostics_fields_present") is False
+            ) or key not in event:
+                structural_missing[key] += 1
+            elif event.get(key) is None:
+                null_values[key] += 1
+
+        schema_v1 = (
+            event.get("reference_diagnostics_schema_version")
+            == REFERENCE_DIAGNOSTICS_SCHEMA_VERSION
+        )
+        if schema_v1:
+            schema_v1_count += 1
+        mode = event.get("reference_sample_mode")
+        if isinstance(mode, str) and mode:
+            all_modes[mode] += 1
+
+        for key in _REFERENCE_PIPELINE_NUMERIC_FIELDS:
+            value = _nonnegative_finite_age(event, key)
+            if value is not None:
+                numeric[key].append(value)
+
+        raw_sequence = _optional_nonnegative_integer(
+            event, "latest_raw_motion_sequence", minimum=1
+        )
+        retarget_sequence = _optional_nonnegative_integer(
+            event, "latest_retarget_raw_motion_sequence", minimum=1
+        )
+        support_sequence = _optional_nonnegative_integer(
+            event, "reference_support_retarget_raw_motion_sequence", minimum=1
+        )
+        for newer, older, destination in (
+            (raw_sequence, retarget_sequence, latest_raw_to_retarget_sequence_lag),
+            (
+                retarget_sequence,
+                support_sequence,
+                latest_retarget_to_support_sequence_lag,
+            ),
+            (raw_sequence, support_sequence, latest_raw_to_support_sequence_lag),
+        ):
+            if newer is None or older is None:
+                continue
+            lag = newer - older
+            if lag < 0:
+                inconsistent_sequence_lag_count += 1
+            else:
+                destination.append(float(lag))
+
+        latest_queue = _nonnegative_finite_age(
+            event, "latest_retarget_worker_queue_us"
+        )
+        latest_compute = _nonnegative_finite_age(
+            event, "latest_retarget_worker_compute_us"
+        )
+        if latest_queue is not None and latest_compute is not None:
+            latest_worker_total_us.append(latest_queue + latest_compute)
+        support_queue = _nonnegative_finite_age(
+            event, "reference_support_worker_queue_us"
+        )
+        support_compute = _nonnegative_finite_age(
+            event, "reference_support_worker_compute_us"
+        )
+        if support_queue is not None and support_compute is not None:
+            support_worker_total_us.append(support_queue + support_compute)
+
+        active_real = (
+            event.get("vr_session_active") is True
+            and event.get("reference_is_transition") is False
+            and event.get("reference_is_padded") is False
+        )
+        if not active_real:
+            continue
+        active_real_count += 1
+        if schema_v1:
+            active_real_schema_v1_count += 1
+        if isinstance(mode, str) and mode:
+            active_modes[mode] += 1
+        upstream_age = _nonnegative_finite_age(
+            event, "reference_upstream_age_at_bridge_ms"
+        )
+        if event.get("reference_source_time_exact") is not True or upstream_age is None:
+            continue
+        eligible_operator_count += 1
+        if upstream_age <= max_upstream_age_ms:
+            upstream_fresh_count += 1
+            continue
+
+        upstream_stale_count += 1
+        if isinstance(mode, str) and mode:
+            stale_modes[mode] += 1
+        if event.get("reference_is_fallback") is True:
+            stale_fallback_count += 1
+        for key in _REFERENCE_PIPELINE_NUMERIC_FIELDS:
+            value = _nonnegative_finite_age(event, key)
+            if value is not None:
+                stale_numeric[key].append(value)
+        latest_drop = _optional_nonnegative_integer(
+            event, "latest_retarget_dropped_before_process"
+        )
+        support_drop = _optional_nonnegative_integer(
+            event, "reference_support_dropped_before_process"
+        )
+        if latest_drop is not None and latest_drop > 0:
+            stale_latest_drop_positive_count += 1
+        if support_drop is not None and support_drop > 0:
+            stale_support_drop_positive_count += 1
+
+        raw_age = _nonnegative_finite_age(
+            event, "latest_raw_motion_age_at_bridge_ms"
+        )
+        retarget_age = _nonnegative_finite_age(
+            event, "latest_retarget_age_at_bridge_ms"
+        )
+        if raw_age is None or retarget_age is None or not schema_v1:
+            root_causes["diagnostics_unknown"] += 1
+        elif raw_age > max_upstream_age_ms:
+            root_causes["xr_body_input_stale"] += 1
+        elif retarget_age > max_upstream_age_ms:
+            root_causes["gmr_output_stale_with_fresh_raw"] += 1
+        else:
+            root_causes["selected_reference_stale_with_fresh_latest"] += 1
+
+    return {
+        "schema_version": REFERENCE_DIAGNOSTICS_SCHEMA_VERSION,
+        "input_events": len(events),
+        "contract": {
+            "all_fields_present_events": fields_present_count,
+            "diagnostics_schema_v1_events": schema_v1_count,
+            "active_real_reference_events": active_real_count,
+            "active_real_schema_v1_events": active_real_schema_v1_count,
+            "structurally_missing_by_field": dict(sorted(structural_missing.items())),
+            "null_by_field": dict(sorted(null_values.items())),
+        },
+        "sample_mode_counts": dict(sorted(all_modes.items())),
+        "active_real_sample_mode_counts": dict(sorted(active_modes.items())),
+        "numeric_distributions": {
+            key: _numeric_summary(values) for key, values in numeric.items()
+        },
+        "derived_distributions": {
+            "latest_raw_minus_retarget_sequence": _numeric_summary(
+                latest_raw_to_retarget_sequence_lag
+            ),
+            "latest_retarget_minus_support_sequence": _numeric_summary(
+                latest_retarget_to_support_sequence_lag
+            ),
+            "latest_raw_minus_support_sequence": _numeric_summary(
+                latest_raw_to_support_sequence_lag
+            ),
+            "latest_retarget_worker_total_us": _numeric_summary(
+                latest_worker_total_us
+            ),
+            "reference_support_worker_total_us": _numeric_summary(
+                support_worker_total_us
+            ),
+            "inconsistent_sequence_lag_values": inconsistent_sequence_lag_count,
+        },
+        "upstream_freshness": {
+            "limit_ms": float(max_upstream_age_ms),
+            "eligible_operator_reference_events": eligible_operator_count,
+            "fresh_events": upstream_fresh_count,
+            "stale_events": upstream_stale_count,
+            "stale_root_cause_counts": dict(sorted(root_causes.items())),
+            "stale_sample_mode_counts": dict(sorted(stale_modes.items())),
+            "stale_fallback_events": stale_fallback_count,
+            "stale_latest_drop_positive_events": (
+                stale_latest_drop_positive_count
+            ),
+            "stale_support_drop_positive_events": (
+                stale_support_drop_positive_count
+            ),
+            "stale_numeric_distributions": {
+                key: _numeric_summary(values)
+                for key, values in stale_numeric.items()
+            },
+        },
+    }
+
+
 def _hand_payload(event: Dict[str, Any]) -> Optional[np.ndarray]:
     if event.get("active") is not True:
         return None
@@ -602,6 +876,22 @@ def _validate_manifest(manifest: Dict[str, Any], episode_dir: Path) -> None:
         != "bounded_nonblocking_sequence_checked"
     ):
         raise ValueError(f"{episode_dir} has incompatible telemetry delivery semantics")
+    diagnostics_schema = source_config.get(
+        "tracking_telemetry_reference_diagnostics_schema_version"
+    )
+    diagnostics_semantics = source_config.get(
+        "tracking_telemetry_reference_diagnostics_semantics"
+    )
+    # Missing values identify a legacy raw manifest and remain convertible;
+    # the per-event report makes its root-cause coverage explicit. If either
+    # marker is declared, both must match the v1 contract.
+    if (diagnostics_schema, diagnostics_semantics) != (None, None) and (
+        diagnostics_schema != REFERENCE_DIAGNOSTICS_SCHEMA_VERSION
+        or diagnostics_semantics != "bridge_gmr_root_cause_v1"
+    ):
+        raise ValueError(
+            f"{episode_dir} has incompatible reference diagnostics semantics"
+        )
     _capture_contract(manifest, episode_dir)
 
 
@@ -673,6 +963,10 @@ def build_episode_samples(
         if start_ns <= _series_time_ns(event) <= stop_ns
     ]
     reference_age_diagnostics = _reference_age_diagnostics(
+        active_telemetry_events,
+        max_upstream_age_ms=max_reference_upstream_age_ms,
+    )
+    reference_pipeline_diagnostics = _reference_pipeline_diagnostics(
         active_telemetry_events,
         max_upstream_age_ms=max_reference_upstream_age_ms,
     )
@@ -859,6 +1153,7 @@ def build_episode_samples(
         synchronization_diagnostics=_sync_diagnostics(streams),
         telemetry_sequence_gaps=_telemetry_gap_count(streams["tracking_telemetry"].events),
         reference_age_diagnostics=reference_age_diagnostics,
+        reference_pipeline_diagnostics=reference_pipeline_diagnostics,
     )
 
 
@@ -976,8 +1271,27 @@ def _report(
         )
     all_samples = [sample for _episode, samples in segments for sample in samples]
     raw_episode_records = []
+    aggregate_root_causes: Counter[str] = Counter()
+    aggregate_stale_modes: Counter[str] = Counter()
+    aggregate_eligible_operator_events = 0
+    aggregate_upstream_stale_events = 0
     for episode in episodes:
         manifest = _load_manifest(episode.episode_dir)
+        upstream_diagnostics = episode.reference_pipeline_diagnostics[
+            "upstream_freshness"
+        ]
+        aggregate_root_causes.update(
+            upstream_diagnostics["stale_root_cause_counts"]
+        )
+        aggregate_stale_modes.update(
+            upstream_diagnostics["stale_sample_mode_counts"]
+        )
+        aggregate_eligible_operator_events += int(
+            upstream_diagnostics["eligible_operator_reference_events"]
+        )
+        aggregate_upstream_stale_events += int(
+            upstream_diagnostics["stale_events"]
+        )
         raw_episode_records.append(
             {
                 "raw_episode": episode.episode_dir.name,
@@ -988,6 +1302,9 @@ def _report(
                 "telemetry_sequence_gaps": episode.telemetry_sequence_gaps,
                 "synchronization_diagnostics": episode.synchronization_diagnostics,
                 "reference_age_diagnostics": episode.reference_age_diagnostics,
+                "reference_pipeline_diagnostics": (
+                    episode.reference_pipeline_diagnostics
+                ),
                 "manifest_status": manifest.get("status"),
                 "success": manifest.get("success"),
                 "validation": manifest.get("validation"),
@@ -1054,6 +1371,18 @@ def _report(
             "accepted_reference_bridge_to_policy_age_ms": _numeric_summary(
                 [float(sample.timing_ms[5]) for sample in all_samples]
             ),
+            "reference_pipeline_root_causes": {
+                "eligible_operator_reference_events": (
+                    aggregate_eligible_operator_events
+                ),
+                "upstream_stale_events": aggregate_upstream_stale_events,
+                "stale_root_cause_counts": dict(
+                    sorted(aggregate_root_causes.items())
+                ),
+                "stale_sample_mode_counts": dict(
+                    sorted(aggregate_stale_modes.items())
+                ),
+            },
         },
         "raw_episodes": raw_episode_records,
         "output_segments": segment_records,
@@ -1140,7 +1469,8 @@ def main() -> None:
             f"[groot] {episode.episode_dir.name}: accepted={len(episode.samples)}/"
             f"{episode.candidate_count}, skipped={episode.skip_counts}, "
             f"telemetry_sequence_gaps={episode.telemetry_sequence_gaps}, "
-            f"reference_age={episode.reference_age_diagnostics}"
+            f"reference_age={episode.reference_age_diagnostics}, "
+            f"reference_pipeline={episode.reference_pipeline_diagnostics}"
         )
 
     output_segments: list[tuple[GrootEpisode, list[GrootSample]]] = []

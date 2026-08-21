@@ -12,9 +12,17 @@ import math
 from typing import Any, Dict, Sequence
 
 try:
-    from .schema import X2_TRACKING_JOINT_NAMES
+    from .schema import (
+        REFERENCE_DIAGNOSTIC_FIELD_NAMES,
+        REFERENCE_DIAGNOSTICS_SCHEMA_VERSION,
+        X2_TRACKING_JOINT_NAMES,
+    )
 except ImportError:  # Direct execution from this directory.
-    from schema import X2_TRACKING_JOINT_NAMES
+    from schema import (
+        REFERENCE_DIAGNOSTIC_FIELD_NAMES,
+        REFERENCE_DIAGNOSTICS_SCHEMA_VERSION,
+        X2_TRACKING_JOINT_NAMES,
+    )
 
 
 TRACKING_TELEMETRY_TOPIC = "tracking_telemetry"
@@ -48,6 +56,14 @@ class TrackingTelemetryProtocolError(ValueError):
 
 class TrackingTelemetryReferenceAgeError(TrackingTelemetryProtocolError):
     """Raised when production telemetry lacks a self-consistent age split."""
+
+    def __init__(self, message: str, *, drop_reason: str) -> None:
+        super().__init__(message)
+        self.drop_reason = str(drop_reason)
+
+
+class TrackingTelemetryReferenceDiagnosticsError(TrackingTelemetryProtocolError):
+    """Raised when live capture lacks the versioned bridge/GMR diagnostics."""
 
     def __init__(self, message: str, *, drop_reason: str) -> None:
         super().__init__(message)
@@ -127,6 +143,21 @@ def _optional_bool(payload: Dict[str, Any], key: str) -> bool | None:
     if payload.get(key) is None:
         return None
     return _strict_bool(payload, key)
+
+
+def _optional_positive_uint64(payload: Dict[str, Any], key: str) -> int | None:
+    if payload.get(key) is None:
+        return None
+    return _strict_int(payload, key, minimum=1, maximum=UINT64_MAX)
+
+
+def _optional_string(payload: Dict[str, Any], key: str) -> str | None:
+    value = payload.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value:
+        raise TrackingTelemetryProtocolError(f"{key} must be a non-empty string or null")
+    return value
 
 
 def parse_tracking_telemetry_parts(parts: Sequence[bytes]) -> Dict[str, Any]:
@@ -239,10 +270,87 @@ def parse_tracking_telemetry_parts(parts: Sequence[bytes]) -> Dict[str, Any]:
         payload, "sensor_generation"
     )
 
+    # Bridge/GMR root-cause diagnostics are additive within telemetry schema
+    # v1.  Normalize every key even for legacy raw input so offline reporting
+    # can distinguish an absent old contract from an explicitly unknown value.
+    normalized["reference_diagnostics_fields_present"] = all(
+        key in payload for key in REFERENCE_DIAGNOSTIC_FIELD_NAMES
+    )
+    diagnostics_version = _optional_uint64(
+        payload, "reference_diagnostics_schema_version"
+    )
+    if (
+        diagnostics_version is not None
+        and diagnostics_version != REFERENCE_DIAGNOSTICS_SCHEMA_VERSION
+    ):
+        raise TrackingTelemetryProtocolError(
+            "reference_diagnostics_schema_version mismatch: expected "
+            f"{REFERENCE_DIAGNOSTICS_SCHEMA_VERSION}, got {diagnostics_version}"
+        )
+    normalized["reference_diagnostics_schema_version"] = diagnostics_version
+    normalized["reference_sample_mode"] = _optional_string(
+        payload, "reference_sample_mode"
+    )
+    for key in (
+        "latest_raw_motion_age_at_bridge_ms",
+        "latest_retarget_age_at_bridge_ms",
+    ):
+        normalized[key] = _optional_finite_number(payload, key)
+    for key in (
+        "bridge_request_to_reply_us",
+        "latest_retarget_worker_queue_us",
+        "latest_retarget_worker_compute_us",
+        "latest_retarget_dropped_before_process",
+        "reference_support_worker_queue_us",
+        "reference_support_worker_compute_us",
+        "reference_support_dropped_before_process",
+    ):
+        normalized[key] = _optional_uint64(payload, key)
+    for key in (
+        "latest_raw_motion_sequence",
+        "latest_retarget_raw_motion_sequence",
+        "reference_support_retarget_raw_motion_sequence",
+    ):
+        normalized[key] = _optional_positive_uint64(payload, key)
+
     # The paired controller wall stamp is the portable synchronization anchor;
     # keep the monotonic stamp as provenance for same-host diagnostics.
     normalized["source_timestamp_ns"] = normalized["sample_wall_time_ns"]
     return normalized
+
+
+def require_reference_diagnostics_contract(event: Dict[str, Any]) -> None:
+    """Require the additive diagnostic wire shape for live production capture.
+
+    The parser remains able to read legacy schema-v1 raw files.  The live
+    ``groot_n17`` recorder deliberately requires every diagnostic key so a new
+    capture cannot silently claim root-cause observability while using an old
+    C++ publisher.  Values may be null for idle/synthetic references.  Once a
+    real operator reference is consumed, the nested schema marker must prove
+    that the instrumented bridge supplied the payload; individual diagnostic
+    values remain nullable and are reported as unknown rather than affecting
+    the training acceptance gate.
+    """
+
+    if event.get("reference_diagnostics_fields_present") is not True:
+        raise TrackingTelemetryReferenceDiagnosticsError(
+            "bridge/GMR diagnostic fields are absent (old controller wire contract)",
+            drop_reason="reference_diagnostics_contract_missing",
+        )
+    real_consumed_reference = (
+        event.get("vr_session_active") is True
+        and event.get("reference_is_transition") is False
+        and event.get("reference_is_padded") is False
+    )
+    if (
+        real_consumed_reference
+        and event.get("reference_diagnostics_schema_version")
+        != REFERENCE_DIAGNOSTICS_SCHEMA_VERSION
+    ):
+        raise TrackingTelemetryReferenceDiagnosticsError(
+            "active operator reference has no bridge/GMR diagnostics-v1 marker",
+            drop_reason="reference_diagnostics_contract_missing",
+        )
 
 
 def require_reference_age_split(event: Dict[str, Any]) -> None:

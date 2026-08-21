@@ -39,7 +39,13 @@ from camera_tap_client import (  # noqa: E402
     read_camera_tap_frame,
 )
 from raw_episode_writer import RawEpisodeManager, RawEpisodeWriter, read_jsonl  # noqa: E402
-from schema import ACTION_NAMES, HAND_ACTION_NAMES, X2_TRACKING_JOINT_NAMES  # noqa: E402
+from schema import (  # noqa: E402
+    ACTION_NAMES,
+    HAND_ACTION_NAMES,
+    REFERENCE_DIAGNOSTIC_FIELD_NAMES,
+    REFERENCE_DIAGNOSTICS_SCHEMA_VERSION,
+    X2_TRACKING_JOINT_NAMES,
+)
 from synchronization import (  # noqa: E402
     TIME_BASIS_RECEIVER,
     TIME_BASIS_SOURCE,
@@ -52,9 +58,11 @@ from tracking_telemetry import (  # noqa: E402
     TRACKING_TELEMETRY_TOPIC,
     TrackingTelemetryProtocolError,
     TrackingTelemetryReferenceAgeError,
+    TrackingTelemetryReferenceDiagnosticsError,
     TrackingTelemetrySequenceTracker,
     parse_tracking_telemetry_parts,
     require_reference_age_split,
+    require_reference_diagnostics_contract,
 )
 from x2_vr_recorder import (  # noqa: E402
     CameraIngressDispatcher,
@@ -152,6 +160,22 @@ def tracking_telemetry_payload(sequence: int = 0):
         "reference_is_padded": False,
         "reference_is_fallback": False,
         "sensor_generation": 1000 + sequence,
+        "reference_diagnostics_schema_version": (
+            REFERENCE_DIAGNOSTICS_SCHEMA_VERSION
+        ),
+        "reference_sample_mode": "interpolate",
+        "latest_raw_motion_age_at_bridge_ms": 4.5,
+        "latest_retarget_age_at_bridge_ms": 7.5,
+        "bridge_request_to_reply_us": 350,
+        "latest_raw_motion_sequence": 2000 + sequence,
+        "latest_retarget_raw_motion_sequence": 1999 + sequence,
+        "latest_retarget_worker_queue_us": 400,
+        "latest_retarget_worker_compute_us": 1400,
+        "latest_retarget_dropped_before_process": 0,
+        "reference_support_retarget_raw_motion_sequence": 1998 + sequence,
+        "reference_support_worker_queue_us": 450,
+        "reference_support_worker_compute_us": 1450,
+        "reference_support_dropped_before_process": 1,
     }
 
 
@@ -1532,6 +1556,9 @@ class TrackingTelemetryProtocolTest(unittest.TestCase):
         self.assertEqual(event["reference_upstream_age_at_bridge_ms"], 2.5)
         self.assertEqual(event["reference_bridge_to_policy_age_ms"], 10.0)
         self.assertTrue(event["reference_age_split_fields_present"])
+        self.assertTrue(event["reference_diagnostics_fields_present"])
+        self.assertEqual(event["reference_sample_mode"], "interpolate")
+        self.assertEqual(event["reference_support_worker_compute_us"], 1450)
         self.assertTrue(
             all(isinstance(value, float) for value in event["policy_action"])
         )
@@ -1578,6 +1605,28 @@ class TrackingTelemetryProtocolTest(unittest.TestCase):
         invalid_generation["sensor_generation"] = -2
         invalid_cases.append(self._parts(invalid_generation))
 
+        wrong_diagnostics_schema = tracking_telemetry_payload()
+        wrong_diagnostics_schema["reference_diagnostics_schema_version"] = 2
+        invalid_cases.append(self._parts(wrong_diagnostics_schema))
+
+        invalid_sample_mode = tracking_telemetry_payload()
+        invalid_sample_mode["reference_sample_mode"] = 1
+        invalid_cases.append(self._parts(invalid_sample_mode))
+
+        invalid_bridge_age = tracking_telemetry_payload()
+        invalid_bridge_age["latest_raw_motion_age_at_bridge_ms"] = -0.1
+        invalid_cases.append(self._parts(invalid_bridge_age))
+
+        invalid_support_sequence = tracking_telemetry_payload()
+        invalid_support_sequence[
+            "reference_support_retarget_raw_motion_sequence"
+        ] = 0
+        invalid_cases.append(self._parts(invalid_support_sequence))
+
+        invalid_worker_time = tracking_telemetry_payload()
+        invalid_worker_time["reference_support_worker_compute_us"] = 1.5
+        invalid_cases.append(self._parts(invalid_worker_time))
+
         invalid_cases.append([b"wrong_topic", b"{}"])
         invalid_cases.append([TRACKING_TELEMETRY_TOPIC.encode("ascii")])
 
@@ -1605,6 +1654,44 @@ class TrackingTelemetryProtocolTest(unittest.TestCase):
         with self.assertRaises(TrackingTelemetryReferenceAgeError) as caught:
             require_reference_age_split(event)
         self.assertEqual(caught.exception.drop_reason, "reference_age_split_missing")
+
+    def test_reference_diagnostics_contract_is_additive_and_live_versioned(self):
+        valid = parse_tracking_telemetry_parts(
+            self._parts(tracking_telemetry_payload())
+        )
+        require_reference_diagnostics_contract(valid)
+
+        legacy = tracking_telemetry_payload()
+        for key in REFERENCE_DIAGNOSTIC_FIELD_NAMES:
+            del legacy[key]
+        parsed_legacy = parse_tracking_telemetry_parts(self._parts(legacy))
+        self.assertFalse(parsed_legacy["reference_diagnostics_fields_present"])
+        self.assertTrue(
+            all(parsed_legacy[key] is None for key in REFERENCE_DIAGNOSTIC_FIELD_NAMES)
+        )
+        with self.assertRaises(TrackingTelemetryReferenceDiagnosticsError) as caught:
+            require_reference_diagnostics_contract(parsed_legacy)
+        self.assertEqual(
+            caught.exception.drop_reason,
+            "reference_diagnostics_contract_missing",
+        )
+
+        idle = tracking_telemetry_payload()
+        idle["vr_session_active"] = False
+        for key in REFERENCE_DIAGNOSTIC_FIELD_NAMES:
+            idle[key] = None
+        require_reference_diagnostics_contract(
+            parse_tracking_telemetry_parts(self._parts(idle))
+        )
+
+        active_without_bridge_marker = dict(idle)
+        active_without_bridge_marker["vr_session_active"] = True
+        with self.assertRaises(TrackingTelemetryReferenceDiagnosticsError):
+            require_reference_diagnostics_contract(
+                parse_tracking_telemetry_parts(
+                    self._parts(active_without_bridge_marker)
+                )
+            )
 
     def test_live_reference_age_split_requires_alias_and_consistent_sum(self):
         valid = parse_tracking_telemetry_parts(

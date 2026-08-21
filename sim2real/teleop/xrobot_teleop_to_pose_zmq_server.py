@@ -100,8 +100,57 @@ def _load_runtime_dependencies(*, visualize: bool = False) -> None:
 
 @dataclass
 class RetargetedFrame:
+    """One GMR result plus fixed-size provenance for latency diagnosis.
+
+    ``recv_ns`` is the bridge ``CLOCK_MONOTONIC`` timestamp at which the raw
+    XR body frame was received, not the later worker-result receive time.
+    Worker durations are null when their monotonic ordering could not be
+    validated.
+    """
+
     recv_ns: int
     qpos: np.ndarray
+    raw_motion_sequence: Optional[int] = None
+    worker_queue_us: Optional[int] = None
+    worker_compute_us: Optional[int] = None
+    worker_dropped_before_process: Optional[int] = None
+
+
+def _nonnegative_duration_us(start_ns: Any, end_ns: Any) -> Optional[int]:
+    """Return a validated monotonic duration, or ``None`` when unavailable."""
+
+    try:
+        start = int(start_ns)
+        end = int(end_ns)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if start < 0 or end < start:
+        return None
+    return int((end - start) // 1_000)
+
+
+def _nonnegative_age_ms(now_ns: Any, source_ns: Any) -> Optional[float]:
+    """Return a validated source age rounded to one microsecond."""
+
+    try:
+        now = int(now_ns)
+        source = int(source_ns)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if source < 0 or now < source:
+        return None
+    return round((now - source) / 1e6, 3)
+
+
+def _nonnegative_int_or_none(value: Any, *, positive: bool = False) -> Optional[int]:
+    """Normalize optional JSON integer diagnostics without inventing zeroes."""
+
+    try:
+        normalized = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    minimum = 1 if positive else 0
+    return normalized if normalized >= minimum else None
 
 
 class _RetargetWorkerRuntime:
@@ -296,6 +345,8 @@ def _retarget_worker_main(
             packet = newer_packet
 
         prev_processed_seq = last_processed_seq
+        worker_start_ns = time.monotonic_ns()
+        worker_queue_us = _nonnegative_duration_us(packet.get("recv_ns"), worker_start_ns)
         try:
             result = runtime.process_packet(packet)
         except Exception as exc:
@@ -305,11 +356,21 @@ def _retarget_worker_main(
                 pass
             continue
 
+        worker_done_ns = time.monotonic_ns()
+        worker_compute_us = _nonnegative_duration_us(worker_start_ns, worker_done_ns)
+        if worker_queue_us is None or worker_compute_us is None:
+            print(
+                "[Warning] invalid retarget worker monotonic timing order "
+                f"seq={packet.get('seq')}"
+            )
+
         if result is None:
             continue
 
         result["dropped_before_process"] = int(dropped_before_process)
         result["prev_processed_seq"] = int(prev_processed_seq)
+        result["worker_queue_us"] = worker_queue_us
+        result["worker_compute_us"] = worker_compute_us
         last_processed_seq = int(result["seq"])
 
         try:
@@ -326,7 +387,13 @@ class LowLatencyTeleopPoseZMQServer:
         self.robot = args.robot
         self.vis_fps = int(args.vis_fps)
         self.ctrl_fps = int(args.ctrl_fps)
-        self.lookback_ns = int(float(args.lookback_ms) * 1e6)
+        lookback_ms = args.lookback_ms
+        if lookback_ms is None:
+            # X2 production capture uses 35 ms to give the retarget worker
+            # enough time to bracket the requested sample. Preserve the
+            # existing direct-CLI default for other robot profiles.
+            lookback_ms = 35.0 if self.robot == "agibot_x2" else 15.0
+        self.lookback_ns = int(float(lookback_ms) * 1e6)
         self.retarget_buffer_window_ns = int(float(args.retarget_buffer_window_s) * 1e9)
         self.log_interval_s = float(args.log_interval_s)
         self.start_fresh_frames = int(args.start_fresh_frames)
@@ -897,13 +964,58 @@ class LowLatencyTeleopPoseZMQServer:
                 except Exception:
                     self._count_tap_prepare_drop()
 
-    def _append_retarget_frame(self, recv_ns: int, qpos: np.ndarray) -> None:
+    def _append_retarget_frame(
+        self,
+        recv_ns: int,
+        qpos: np.ndarray,
+        *,
+        raw_motion_sequence: Optional[int] = None,
+        worker_queue_us: Optional[int] = None,
+        worker_compute_us: Optional[int] = None,
+        worker_dropped_before_process: Optional[int] = None,
+    ) -> None:
         cutoff_ns = recv_ns - self.retarget_buffer_window_ns
+        frame = RetargetedFrame(
+            recv_ns=recv_ns,
+            qpos=qpos.astype(np.float32, copy=True),
+            raw_motion_sequence=_nonnegative_int_or_none(raw_motion_sequence, positive=True),
+            worker_queue_us=_nonnegative_int_or_none(worker_queue_us),
+            worker_compute_us=_nonnegative_int_or_none(worker_compute_us),
+            worker_dropped_before_process=_nonnegative_int_or_none(
+                worker_dropped_before_process
+            ),
+        )
         with self.retarget_buffer_condition:
-            self.retarget_buffer.append(RetargetedFrame(recv_ns=recv_ns, qpos=qpos.astype(np.float32, copy=True)))
+            self.retarget_buffer.append(frame)
             while self.retarget_buffer and self.retarget_buffer[0].recv_ns < cutoff_ns:
                 self.retarget_buffer.popleft()
             self.retarget_buffer_condition.notify_all()
+
+    @staticmethod
+    def _support_diagnostics(frame: Optional[RetargetedFrame]) -> Dict[str, Optional[int]]:
+        """Describe the GMR result supporting a sampled reference.
+
+        Interpolation uses its newer bracketing frame as the diagnostic support
+        result. Exact/fallback/start modes use the actual selected frame.
+        """
+
+        if frame is None:
+            return {
+                "support_raw_motion_sequence": None,
+                "support_worker_queue_us": None,
+                "support_worker_compute_us": None,
+                "support_worker_dropped_before_process": None,
+            }
+        return {
+            "support_raw_motion_sequence": _nonnegative_int_or_none(
+                frame.raw_motion_sequence, positive=True
+            ),
+            "support_worker_queue_us": _nonnegative_int_or_none(frame.worker_queue_us),
+            "support_worker_compute_us": _nonnegative_int_or_none(frame.worker_compute_us),
+            "support_worker_dropped_before_process": _nonnegative_int_or_none(
+                frame.worker_dropped_before_process
+            ),
+        }
 
     @staticmethod
     def _copy_human_motion_data(human_motion_data: Any) -> Optional[Dict[str, Any]]:
@@ -971,6 +1083,7 @@ class LowLatencyTeleopPoseZMQServer:
             "buffer_len": 0,
             "fresh_frame_count": 0,
             "latest_age_ms": None,
+            **self._support_diagnostics(None),
         }
 
         with self.retarget_buffer_condition:
@@ -1002,6 +1115,7 @@ class LowLatencyTeleopPoseZMQServer:
                     "latest_age_ms": (
                         None if newest_age_ns is None else round(newest_age_ns / 1e6, 3)
                     ),
+                    **self._support_diagnostics(newest),
                 }
 
                 if (
@@ -1018,6 +1132,7 @@ class LowLatencyTeleopPoseZMQServer:
                             "newer_ns": int(selected.recv_ns),
                             "selected_recv_ns": int(selected.recv_ns),
                             "selected_age_ms": round(max(0, now_ns - selected.recv_ns) / 1e6, 3),
+                            **self._support_diagnostics(selected),
                         }
                     )
                     return selected.qpos.astype(np.float32, copy=True), ready_info
@@ -1038,6 +1153,7 @@ class LowLatencyTeleopPoseZMQServer:
                 "newer_ns": None,
                 "alpha": None,
                 "buffer_len": 0,
+                **self._support_diagnostics(None),
         }
         if len(frames) == 1:
             only_ns = frames[0].recv_ns
@@ -1048,6 +1164,7 @@ class LowLatencyTeleopPoseZMQServer:
                 "newer_ns": only_ns,
                 "alpha": None,
                 "buffer_len": 1,
+                **self._support_diagnostics(frames[0]),
             }
         if target_ns <= frames[0].recv_ns:
             oldest_ns = frames[0].recv_ns
@@ -1058,6 +1175,7 @@ class LowLatencyTeleopPoseZMQServer:
                 "newer_ns": oldest_ns,
                 "alpha": None,
                 "buffer_len": len(frames),
+                **self._support_diagnostics(frames[0]),
             }
         if target_ns >= frames[-1].recv_ns:
             latest_ns = frames[-1].recv_ns
@@ -1068,6 +1186,7 @@ class LowLatencyTeleopPoseZMQServer:
                 "newer_ns": latest_ns,
                 "alpha": None,
                 "buffer_len": len(frames),
+                **self._support_diagnostics(frames[-1]),
             }
 
         for idx in range(1, len(frames)):
@@ -1084,6 +1203,7 @@ class LowLatencyTeleopPoseZMQServer:
                         "newer_ns": same_ns,
                         "alpha": None,
                         "buffer_len": len(frames),
+                        **self._support_diagnostics(next_frame),
                     }
                 alpha = float(target_ns - prev_frame.recv_ns) / float(dt)
                 return self._interpolate_qpos(prev_frame.qpos, next_frame.qpos, alpha), False, {
@@ -1093,6 +1213,7 @@ class LowLatencyTeleopPoseZMQServer:
                     "newer_ns": next_frame.recv_ns,
                     "alpha": alpha,
                     "buffer_len": len(frames),
+                    **self._support_diagnostics(next_frame),
                 }
 
         latest_ns = frames[-1].recv_ns
@@ -1103,6 +1224,7 @@ class LowLatencyTeleopPoseZMQServer:
             "newer_ns": latest_ns,
             "alpha": None,
             "buffer_len": len(frames),
+            **self._support_diagnostics(frames[-1]),
         }
 
     def _build_reply_frames(self, req_recv_ns: int) -> tuple[list[np.ndarray], bool, Dict[str, Any]]:
@@ -1130,6 +1252,81 @@ class LowLatencyTeleopPoseZMQServer:
             retarget_age_ms = round((now_ns - latest_retarget_recv_ns) / 1e6, 3)
 
         return retarget_age_ms, raw_motion_age_ms
+
+    def _build_reference_diagnostics(
+        self,
+        *,
+        sample_info: Dict[str, Any],
+        req_recv_ns: int,
+        reply_now_ns: int,
+    ) -> Dict[str, Any]:
+        """Build schema-v1 fixed-scalar diagnostics for one reference reply."""
+
+        with self.latest_vr_lock:
+            raw_recv_ns = int(getattr(self, "latest_vr_recv_ns", 0))
+            latest_raw_recv_ns = raw_recv_ns if raw_recv_ns > 0 else None
+            latest_raw_sequence = _nonnegative_int_or_none(
+                getattr(self, "latest_vr_seq", 0), positive=True
+            )
+
+        with self.retarget_buffer_lock:
+            latest_retarget = self.retarget_buffer[-1] if self.retarget_buffer else None
+
+        latest_retarget_recv_ns = (
+            None if latest_retarget is None else int(latest_retarget.recv_ns)
+        )
+        latest_retarget_sequence = (
+            None
+            if latest_retarget is None
+            else _nonnegative_int_or_none(
+                latest_retarget.raw_motion_sequence, positive=True
+            )
+        )
+
+        return {
+            "reference_diagnostics_schema_version": 1,
+            "reference_sample_mode": sample_info.get("mode"),
+            "latest_raw_motion_age_at_bridge_ms": _nonnegative_age_ms(
+                reply_now_ns, latest_raw_recv_ns
+            ),
+            "latest_retarget_age_at_bridge_ms": _nonnegative_age_ms(
+                reply_now_ns, latest_retarget_recv_ns
+            ),
+            "bridge_request_to_reply_us": _nonnegative_duration_us(
+                req_recv_ns, reply_now_ns
+            ),
+            "latest_raw_motion_sequence": latest_raw_sequence,
+            "latest_retarget_raw_motion_sequence": latest_retarget_sequence,
+            "latest_retarget_worker_queue_us": (
+                None
+                if latest_retarget is None
+                else _nonnegative_int_or_none(latest_retarget.worker_queue_us)
+            ),
+            "latest_retarget_worker_compute_us": (
+                None
+                if latest_retarget is None
+                else _nonnegative_int_or_none(latest_retarget.worker_compute_us)
+            ),
+            "latest_retarget_dropped_before_process": (
+                None
+                if latest_retarget is None
+                else _nonnegative_int_or_none(
+                    latest_retarget.worker_dropped_before_process
+                )
+            ),
+            "reference_support_retarget_raw_motion_sequence": _nonnegative_int_or_none(
+                sample_info.get("support_raw_motion_sequence"), positive=True
+            ),
+            "reference_support_worker_queue_us": _nonnegative_int_or_none(
+                sample_info.get("support_worker_queue_us")
+            ),
+            "reference_support_worker_compute_us": _nonnegative_int_or_none(
+                sample_info.get("support_worker_compute_us")
+            ),
+            "reference_support_dropped_before_process": _nonnegative_int_or_none(
+                sample_info.get("support_worker_dropped_before_process")
+            ),
+        }
 
     def _update_debug_info(self, sample_info: Dict[str, Any], req_recv_ns: int) -> None:
         older_ns = sample_info.get("older_ns")
@@ -1259,7 +1456,16 @@ class LowLatencyTeleopPoseZMQServer:
             if payload_type != "retarget_result":
                 continue
 
-            dropped_before_process = int(payload.get("dropped_before_process", 0))
+            worker_queue_us = _nonnegative_int_or_none(payload.get("worker_queue_us"))
+            worker_compute_us = _nonnegative_int_or_none(payload.get("worker_compute_us"))
+            worker_dropped_before_process = _nonnegative_int_or_none(
+                payload.get("dropped_before_process")
+            )
+            dropped_before_process = (
+                0
+                if worker_dropped_before_process is None
+                else worker_dropped_before_process
+            )
             if dropped_before_process > 0:
                 self.raw_motion_drop_count += dropped_before_process
                 self._warn_on_raw_motion_drop(
@@ -1270,7 +1476,14 @@ class LowLatencyTeleopPoseZMQServer:
 
             qpos_curr = np.asarray(payload.get("qpos"), dtype=np.float32).reshape(-1)
             recv_ns = int(payload["recv_ns"])
-            self._append_retarget_frame(recv_ns=recv_ns, qpos=qpos_curr)
+            self._append_retarget_frame(
+                recv_ns=recv_ns,
+                qpos=qpos_curr,
+                raw_motion_sequence=payload.get("seq"),
+                worker_queue_us=worker_queue_us,
+                worker_compute_us=worker_compute_us,
+                worker_dropped_before_process=worker_dropped_before_process,
+            )
             self.retarget_count += 1
             if self._tap_enabled("retarget"):
                 try:
@@ -1282,6 +1495,8 @@ class LowLatencyTeleopPoseZMQServer:
                             "bridge_recv_monotonic_ns": int(recv_ns),
                             "qpos_root_xyz_quat_wxyz_dof": qpos_curr[:36].tolist(),
                             "dropped_before_process": dropped_before_process,
+                            "worker_queue_us": worker_queue_us,
+                            "worker_compute_us": worker_compute_us,
                         },
                     )
                 except Exception:
@@ -1499,6 +1714,12 @@ class LowLatencyTeleopPoseZMQServer:
                     max(0, reply_now_ns - int(reference_source_ns)) / 1e6, 3
                 )
 
+            reference_diagnostics = self._build_reference_diagnostics(
+                sample_info=sample_info,
+                req_recv_ns=req_recv_ns,
+                reply_now_ns=reply_now_ns,
+            )
+
             payload = {
                 "start": request_start,
                 "no_interp_applied": bool(used_fallback),
@@ -1516,6 +1737,7 @@ class LowLatencyTeleopPoseZMQServer:
                     else int(reference_source_ns)
                 ),
                 "bridge_reply_monotonic_ns": int(reply_now_ns),
+                **reference_diagnostics,
                 "t_rep_ms": int(time.time() * 1000),
                 "frames": [self._serialize_qpos_frame(x) for x in out_frames],
             }
@@ -1580,6 +1802,7 @@ class LowLatencyTeleopPoseZMQServer:
                                     else int(reference_source_ns)
                                 ),
                                 "bridge_reply_monotonic_ns": int(reply_now_ns),
+                                **reference_diagnostics,
                                 "frames_qpos_root_xyz_quat_wxyz_dof": [
                                     np.asarray(frame, dtype=np.float32).reshape(-1)[:36].tolist()
                                     for frame in out_frames
@@ -2022,8 +2245,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--lookback_ms",
         type=float,
-        default=15.0,
-        help="Sample reply frames at request_time - lookback_ms",
+        default=None,
+        help=(
+            "Sample reply frames at request_time - lookback_ms "
+            "(default: 35 ms for agibot_x2, 15 ms otherwise)"
+        ),
     )
     parser.add_argument(
         "--retarget_buffer_window_s",

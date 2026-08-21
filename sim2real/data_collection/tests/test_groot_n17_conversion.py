@@ -18,6 +18,7 @@ from convert_to_groot_n17 import (  # noqa: E402
     _capture_contract,
     _quat_wxyz_to_rot6d,
     _reference_age_components,
+    _reference_pipeline_diagnostics,
     _telemetry_payload,
     _validate_modality_json,
     _validate_manifest,
@@ -29,6 +30,8 @@ from schema import (  # noqa: E402
     GROOT_N17_ACTION_NAMES,
     GROOT_N17_STATE_NAMES,
     GROOT_N17_TIMING_NAMES,
+    REFERENCE_DIAGNOSTIC_FIELD_NAMES,
+    REFERENCE_DIAGNOSTICS_SCHEMA_VERSION,
     X2_TRACKING_JOINT_NAMES,
 )
 
@@ -82,6 +85,22 @@ class GrootN17ConversionTest(unittest.TestCase):
             "projected_gravity": [0.0, 0.0, -1.0],
             "policy_action": [0.0] * 29,
             "command_joint_position": [0.0] * 29,
+            "reference_diagnostics_schema_version": (
+                REFERENCE_DIAGNOSTICS_SCHEMA_VERSION
+            ),
+            "reference_sample_mode": "interpolate",
+            "latest_raw_motion_age_at_bridge_ms": 8.0,
+            "latest_retarget_age_at_bridge_ms": 12.0,
+            "bridge_request_to_reply_us": 300,
+            "latest_raw_motion_sequence": 103,
+            "latest_retarget_raw_motion_sequence": 102,
+            "latest_retarget_worker_queue_us": 400,
+            "latest_retarget_worker_compute_us": 1200,
+            "latest_retarget_dropped_before_process": 0,
+            "reference_support_retarget_raw_motion_sequence": 101,
+            "reference_support_worker_queue_us": 450,
+            "reference_support_worker_compute_us": 1250,
+            "reference_support_dropped_before_process": 1,
         }
 
     def test_schema_dimensions(self):
@@ -124,6 +143,10 @@ class GrootN17ConversionTest(unittest.TestCase):
                 "tracking_telemetry_delivery_semantics": (
                     "bounded_nonblocking_sequence_checked"
                 ),
+                "tracking_telemetry_reference_diagnostics_schema_version": 1,
+                "tracking_telemetry_reference_diagnostics_semantics": (
+                    "bridge_gmr_root_cause_v1"
+                ),
                 "bridge_runtime_effective_params": (
                     self._bridge_runtime_effective_params()
                 ),
@@ -162,6 +185,13 @@ class GrootN17ConversionTest(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "bridge runtime effective params"):
             _validate_manifest(missing_runtime_param, Path("episode_000000"))
+
+        bad_diagnostics = json.loads(json.dumps(manifest))
+        bad_diagnostics["source_config"][
+            "tracking_telemetry_reference_diagnostics_semantics"
+        ] = "unknown"
+        with self.assertRaisesRegex(ValueError, "reference diagnostics"):
+            _validate_manifest(bad_diagnostics, Path("episode_000000"))
 
     def test_quaternion_to_gr00t_row_major_rot6d(self):
         angle = math.pi / 2.0
@@ -229,6 +259,98 @@ class GrootN17ConversionTest(unittest.TestCase):
         self.assertEqual(
             _reference_age_components(missing_bridge_component)[1],
             "reference_age_split_missing",
+        )
+
+    def test_reference_pipeline_diagnostics_classify_without_changing_gate(self):
+        base = self._telemetry()
+        base.update(
+            {
+                "vr_session_active": True,
+                "reference_source_time_exact": True,
+                "reference_is_transition": False,
+                "reference_is_padded": False,
+                "reference_is_fallback": True,
+                "reference_upstream_age_at_bridge_ms": 90.0,
+            }
+        )
+        xr_stale = dict(
+            base,
+            latest_raw_motion_age_at_bridge_ms=120.0,
+            latest_retarget_age_at_bridge_ms=130.0,
+        )
+        gmr_stale = dict(
+            base,
+            latest_raw_motion_age_at_bridge_ms=10.0,
+            latest_retarget_age_at_bridge_ms=120.0,
+            reference_sample_mode="fallback_latest",
+        )
+        selected_old = dict(
+            base,
+            latest_raw_motion_age_at_bridge_ms=10.0,
+            latest_retarget_age_at_bridge_ms=20.0,
+            reference_sample_mode="fallback_oldest",
+        )
+        unknown = dict(
+            base,
+            reference_diagnostics_schema_version=None,
+            latest_raw_motion_age_at_bridge_ms=None,
+        )
+        fresh = dict(base, reference_upstream_age_at_bridge_ms=20.0)
+
+        report = _reference_pipeline_diagnostics(
+            [xr_stale, gmr_stale, selected_old, unknown, fresh],
+            max_upstream_age_ms=80.0,
+        )
+
+        upstream = report["upstream_freshness"]
+        self.assertEqual(upstream["eligible_operator_reference_events"], 5)
+        self.assertEqual(upstream["fresh_events"], 1)
+        self.assertEqual(upstream["stale_events"], 4)
+        self.assertEqual(
+            upstream["stale_root_cause_counts"],
+            {
+                "diagnostics_unknown": 1,
+                "gmr_output_stale_with_fresh_raw": 1,
+                "selected_reference_stale_with_fresh_latest": 1,
+                "xr_body_input_stale": 1,
+            },
+        )
+        self.assertEqual(upstream["stale_fallback_events"], 4)
+        self.assertEqual(
+            report["derived_distributions"][
+                "latest_raw_minus_retarget_sequence"
+            ]["p50"],
+            1.0,
+        )
+        self.assertEqual(
+            report["numeric_distributions"]["bridge_request_to_reply_us"][
+                "count"
+            ],
+            5,
+        )
+
+    def test_reference_pipeline_diagnostics_honor_explicit_legacy_marker(self):
+        legacy = self._telemetry()
+        legacy["reference_diagnostics_fields_present"] = False
+        for key in REFERENCE_DIAGNOSTIC_FIELD_NAMES:
+            legacy[key] = None
+
+        report = _reference_pipeline_diagnostics(
+            [legacy], max_upstream_age_ms=80.0
+        )
+
+        contract = report["contract"]
+        self.assertEqual(contract["all_fields_present_events"], 0)
+        self.assertEqual(contract["diagnostics_schema_v1_events"], 0)
+        self.assertEqual(
+            set(contract["structurally_missing_by_field"]),
+            set(REFERENCE_DIAGNOSTIC_FIELD_NAMES),
+        )
+        self.assertTrue(
+            all(
+                count == 1
+                for count in contract["structurally_missing_by_field"].values()
+            )
         )
 
     def test_segment_requires_true_25hz_continuity(self):
@@ -402,6 +524,10 @@ class GrootN17ConversionTest(unittest.TestCase):
                     "tracking_telemetry_delivery_semantics": (
                         "bounded_nonblocking_sequence_checked"
                     ),
+                    "tracking_telemetry_reference_diagnostics_schema_version": 1,
+                    "tracking_telemetry_reference_diagnostics_semantics": (
+                        "bridge_gmr_root_cause_v1"
+                    ),
                     "bridge_runtime_effective_params": (
                         self._bridge_runtime_effective_params()
                     ),
@@ -490,6 +616,18 @@ class GrootN17ConversionTest(unittest.TestCase):
             self.assertEqual(first.action.shape, (40,))
             self.assertEqual(first.timing_ms.shape, (6,))
             np.testing.assert_allclose(first.timing_ms[3:], [120.0, 20.0, 100.0])
+            self.assertEqual(
+                converted.reference_pipeline_diagnostics["contract"][
+                    "diagnostics_schema_v1_events"
+                ],
+                frame_count - 1,
+            )
+            self.assertEqual(
+                converted.reference_pipeline_diagnostics[
+                    "numeric_distributions"
+                ]["reference_support_worker_compute_us"]["p95"],
+                1250.0,
+            )
             np.testing.assert_allclose(first.state[64:73], first.action[:9])
             np.testing.assert_allclose(first.state[73:102], first.action[9:38])
             np.testing.assert_allclose(first.action[38:40], [0.25, 0.75])

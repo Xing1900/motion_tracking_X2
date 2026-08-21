@@ -15,6 +15,27 @@ from typing import Any, Mapping
 RAW_DATASET_SCHEMA_VERSION = "x2-vr-raw-v1"
 TELEOP_TAP_SCHEMA_VERSION = 1
 
+# Additive schema-v1 diagnostics carried by the C++ tracking telemetry.  The
+# outer telemetry schema remains version 1 so legacy raw episodes stay
+# readable; this nested marker identifies the bridge/GMR diagnostic contract.
+REFERENCE_DIAGNOSTICS_SCHEMA_VERSION = 1
+REFERENCE_DIAGNOSTIC_FIELD_NAMES = (
+    "reference_diagnostics_schema_version",
+    "reference_sample_mode",
+    "latest_raw_motion_age_at_bridge_ms",
+    "latest_retarget_age_at_bridge_ms",
+    "bridge_request_to_reply_us",
+    "latest_raw_motion_sequence",
+    "latest_retarget_raw_motion_sequence",
+    "latest_retarget_worker_queue_us",
+    "latest_retarget_worker_compute_us",
+    "latest_retarget_dropped_before_process",
+    "reference_support_retarget_raw_motion_sequence",
+    "reference_support_worker_queue_us",
+    "reference_support_worker_compute_us",
+    "reference_support_dropped_before_process",
+)
+
 BRIDGE_RUNTIME_EFFECTIVE_PARAM_NAMES = (
     "actual_human_height",
     "gmr_max_iter",

@@ -112,6 +112,29 @@ steady-clock stamps to publish `reference_upstream_age_at_bridge_ms`,
 `reference_bridge_to_policy_age_ms`, and `reference_total_age_ms`; the legacy
 `reference_source_age_ms` remains an alias of the total for schema-v1 readers.
 
+The same telemetry event also retains additive bridge/GMR root-cause
+diagnostics: sample mode, latest raw-motion and retarget ages, bridge
+request-to-reply time, raw/retarget/support sequences, worker queue/compute
+times, and latest-only drops before processing. These fields explain rejected
+upstream-stale samples; they do not replace or relax the 80 ms upstream gate.
+The flat JSON keys are:
+
+```text
+reference_diagnostics_schema_version, reference_sample_mode,
+latest_raw_motion_age_at_bridge_ms, latest_retarget_age_at_bridge_ms,
+bridge_request_to_reply_us, latest_raw_motion_sequence,
+latest_retarget_raw_motion_sequence, latest_retarget_worker_queue_us,
+latest_retarget_worker_compute_us, latest_retarget_dropped_before_process,
+reference_support_retarget_raw_motion_sequence,
+reference_support_worker_queue_us, reference_support_worker_compute_us,
+reference_support_dropped_before_process
+```
+
+For interpolation, the `reference_support_*` values describe the newer
+bracketing retarget frame; for a direct/fallback sample they describe the
+actual supporting frame, and for a default/synthetic reference they may be
+null.
+
 For the older ROS-state `vla` session, add:
 
 ```bash
@@ -236,6 +259,9 @@ description. If the bridge is started with a non-default height, GMR iteration
 count, or lookback, set the matching `X2_VR_HUMAN_HEIGHT`,
 `X2_VR_GMR_MAX_ITER`, or
 `X2_VR_LOOKBACK_MS` environment variable when starting the wrapper.
+The wrapper default is `X2_VR_LOOKBACK_MS=35.0`; start the bridge with the same
+`--lookback_ms 35.0` value. If you intentionally change it, override both the
+bridge argument and the wrapper variable so the manifest records reality.
 
 The expanded command is retained here for non-standard layouts and debugging:
 
@@ -256,7 +282,7 @@ cd /digit/run/x2_vr_data_collection
   --camera_tap_addr tcp://127.0.0.1:28706 \
   --bridge_actual_human_height 1.7 \
   --bridge_gmr_max_iter 0 \
-  --bridge_lookback_ms 25.0 \
+  --bridge_lookback_ms 35.0 \
   --bridge_min_link_height 0.0 \
   --bridge_min_link_height_align_strategy startup_fixed \
   --bridge_min_link_height_bootstrap_frames 10 \
@@ -275,7 +301,7 @@ cd /digit/run/x2_vr_data_collection
 Replace the three `/actual/path/...` entries with the files used by the running
 robot processes (use `readlink -f` if they are symlinks). Set every
 `--bridge_*` value to the effective value used to start that bridge; the values
-above match the current robot bundle (`1.7`, `0`, and `25 ms`), not an
+above match the current robot bundle (`1.7`, `0`, and `35 ms`), not an
 instruction to overwrite future robot-specific settings. The recorder
 automatically hashes its running script plus the eight
 declared artifacts into every manifest. The strict N1.7 converter rejects a
@@ -301,7 +327,7 @@ cd ~/Documents/motion_tracking/sim2real/data_collection
   --camera_tap_addr tcp://172.66.88.241:28706 \
   --bridge_actual_human_height 1.7 \
   --bridge_gmr_max_iter 0 \
-  --bridge_lookback_ms 25.0 \
+  --bridge_lookback_ms 35.0 \
   --bridge_min_link_height 0.0 \
   --bridge_min_link_height_align_strategy startup_fixed \
   --bridge_min_link_height_bootstrap_frames 10 \
@@ -479,6 +505,25 @@ are not written; the first one increments
 rebuild/restart error. An old controller therefore cannot start a seemingly
 usable production capture; if A was already pressed, that episode is preserved
 as interrupted rather than valid.
+
+Bridge/GMR diagnostics use a nested additive contract marker,
+`reference_diagnostics_schema_version=1`, while the outer telemetry schema
+remains version 1. The live recorder requires all diagnostic keys to be
+structurally present, and an active non-transition/non-padded reference must
+carry the v1 marker. Idle, local/synthetic, and temporarily unavailable
+individual measurements may remain null. Legacy raw files without these keys
+remain readable and convertible under the unchanged upstream-age gate, but the
+conversion report explicitly shows zero diagnostic coverage; batches do not
+silently mix legacy and diagnostic capture contracts.
+
+The dry-run and final `conversion_report.json` include per-field coverage and
+P50/P95/P99 distributions, sample-mode counts, sequence lag, worker
+queue/compute time and drain-drop counts. For upstream age above 80 ms, the
+report conservatively classifies events as `xr_body_input_stale`,
+`gmr_output_stale_with_fresh_raw`,
+`selected_reference_stale_with_fresh_latest`, or `diagnostics_unknown`.
+Classification is diagnostic only: transition/padded filters, the 80 ms gate,
+and controller low-watermark semantics are unchanged.
 
 The output row is 104-D state and 40-D consumed reference action. Raw telemetry
 keeps the global aligned reference; each output segment is rigidly rebased into
