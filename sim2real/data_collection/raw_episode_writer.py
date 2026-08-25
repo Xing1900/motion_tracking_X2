@@ -158,6 +158,7 @@ class RawEpisodeWriter:
                 "start_wall_time_ns": int(start_wall_time_ns),
                 "stop_trigger_monotonic_ns": None,
                 "finalized_monotonic_ns": None,
+                "termination": None,
                 "pre_roll_s": source_config.get("pre_roll_s"),
                 "post_roll_s": source_config.get("post_roll_s"),
             },
@@ -490,6 +491,7 @@ class RawEpisodeWriter:
         stop_trigger_monotonic_ns: Optional[int],
         success: Optional[bool],
         ingress_drops: Dict[str, int],
+        termination: Optional[Dict[str, Any]] = None,
         abort_requested: Optional[Callable[[], bool]] = None,
     ) -> Path:
         if self._closed:
@@ -527,6 +529,9 @@ class RawEpisodeWriter:
 
         self._manifest["status"] = str(status)
         self._manifest["success"] = success
+        self._manifest["recording"]["termination"] = (
+            None if termination is None else dict(termination)
+        )
         self._manifest["stream_counts"] = dict(sorted(self._counts.items()))
         merged_drops: Counter[str] = Counter(
             {
@@ -626,6 +631,16 @@ class RawEpisodeWriter:
             if not passed:
                 failed_matching_event_requirements.append(requirement["name"])
 
+        explicit_invalid_reasons: list[str] = []
+        if status == "invalid":
+            termination_reason = (
+                str(termination.get("reason", "")).strip()
+                if isinstance(termination, dict)
+                else ""
+            )
+            explicit_invalid_reasons.append(
+                termination_reason or "explicit_invalid_status"
+            )
         validation_valid = not any(
             (
                 missing_streams,
@@ -634,6 +649,7 @@ class RawEpisodeWriter:
                 missing_joint_topics,
                 stale_joint_topics,
                 failed_matching_event_requirements,
+                explicit_invalid_reasons,
             )
         )
         self._manifest["validation"] = {
@@ -651,6 +667,7 @@ class RawEpisodeWriter:
             "stale_joint_topics": sorted(stale_joint_topics),
             "matching_event_requirements": matching_event_requirements,
             "failed_matching_event_requirements": failed_matching_event_requirements,
+            "explicit_invalid_reasons": explicit_invalid_reasons,
             "valid": validation_valid,
         }
         if status == "complete" and not validation_valid:
@@ -708,6 +725,29 @@ class RawEpisodeManager:
         }
         self.drop_counts = drop_counts
 
+        required_streams = {
+            str(stream)
+            for stream in self.source_config.get("required_streams", [])
+        }
+        start_max_age_s = self.source_config.get("camera_start_max_age_s")
+        stall_timeout_s = self.source_config.get("camera_stall_timeout_s")
+        # Old/raw diagnostic callers do not carry these keys.  Preserve their
+        # historical behavior unless both guards are explicitly configured.
+        self._camera_guard_enabled = (
+            "camera_head" in required_streams
+            and start_max_age_s is not None
+            and stall_timeout_s is not None
+        )
+        self._camera_start_max_age_ns = 0
+        self._camera_stall_timeout_ns = 0
+        if self._camera_guard_enabled:
+            if float(start_max_age_s) <= 0.0:
+                raise ValueError("camera_start_max_age_s must be positive")
+            if float(stall_timeout_s) <= 0.0:
+                raise ValueError("camera_stall_timeout_s must be positive")
+            self._camera_start_max_age_ns = int(float(start_max_age_s) * 1e9)
+            self._camera_stall_timeout_ns = int(float(stall_timeout_s) * 1e9)
+
         self._pre_roll: Deque[Dict[str, Any]] = deque()
         # Camera routing has its own lock/pre-roll so high-rate synchronous
         # state JSON writes under _lock cannot delay the camera ingress worker.
@@ -715,12 +755,16 @@ class RawEpisodeManager:
         # camera path never acquires _lock, so the order cannot deadlock.
         self._camera_pre_roll: Deque[Dict[str, Any]] = deque()
         self._camera_route_lock = threading.Lock()
+        # Protected by _camera_route_lock.  This is deliberately recorder
+        # receive time, not a camera/source clock that may regress or jump.
+        self._last_camera_recv_monotonic_ns: Optional[int] = None
         self._writer: Optional[RawEpisodeWriter] = None
         self._next_episode_index = self._find_next_episode_index()
         self._prev_start = False
         self._prev_stop = False
         self._stop_trigger_ns: Optional[int] = None
         self._finalize_deadline_ns: Optional[int] = None
+        self._termination: Optional[Dict[str, Any]] = None
         self._drop_baseline: Dict[str, int] = {}
         self._lock = threading.Lock()
         # A supervisor must be able to latch failure even while the writer
@@ -800,6 +844,7 @@ class RawEpisodeManager:
             source_config=self.source_config,
         )
         self._next_episode_index += 1
+        self._termination = None
         cutoff_ns = now_ns - self.pre_roll_ns
         buffered_events = sorted(
             (
@@ -831,6 +876,65 @@ class RawEpisodeManager:
         self._pre_roll.clear()
         print(f"[recorder] episode {new_writer.episode_index:06d} started | task={self.task!r}")
 
+    def _camera_start_rejection(self, now_ns: int) -> Optional[str]:
+        """Return a human-readable reason when a required camera is not fresh."""
+
+        if not self._camera_guard_enabled:
+            return None
+        with self._camera_route_lock:
+            last_camera_ns = self._last_camera_recv_monotonic_ns
+        if last_camera_ns is None:
+            return "no camera frame has reached the recorder"
+        age_ns = max(0, int(now_ns) - int(last_camera_ns))
+        if age_ns <= self._camera_start_max_age_ns:
+            return None
+        return (
+            f"latest camera frame is {age_ns / 1e9:.3f}s old "
+            f"(limit={self._camera_start_max_age_ns / 1e9:.3f}s)"
+        )
+
+    def _camera_stall_evidence(self, now_ns: int) -> Optional[Dict[str, Any]]:
+        """Describe an active-recording camera stall, if one has occurred.
+
+        The caller owns ``_lock``.  It only takes ``_camera_route_lock`` in the
+        existing manager order; the camera ingress path never takes ``_lock``.
+        """
+
+        if (
+            not self._camera_guard_enabled
+            or self._writer is None
+            or self._finalize_deadline_ns is not None
+        ):
+            return None
+        with self._camera_route_lock:
+            last_camera_ns = self._last_camera_recv_monotonic_ns
+        if last_camera_ns is None:
+            return None
+        age_ns = max(0, int(now_ns) - int(last_camera_ns))
+        if age_ns <= self._camera_stall_timeout_ns:
+            return None
+        return {
+            "reason": "camera_stall",
+            "detected_monotonic_ns": int(now_ns),
+            "last_camera_recv_monotonic_ns": int(last_camera_ns),
+            "camera_age_s": age_ns / 1e9,
+            "stall_timeout_s": self._camera_stall_timeout_ns / 1e9,
+        }
+
+    def _finish_camera_stall_if_needed(self, now_ns: int) -> Optional[Path]:
+        evidence = self._camera_stall_evidence(now_ns)
+        if evidence is None:
+            return None
+        assert self._writer is not None
+        self._stop_trigger_ns = int(now_ns)
+        self._termination = evidence
+        self._writer.mark_stop_trigger(int(now_ns))
+        print(
+            "[recorder] camera stalled for "
+            f"{evidence['camera_age_s']:.3f}s; saving episode as invalid"
+        )
+        return self._finish_episode(status="invalid", success=None)
+
     def _finish_episode(self, status: str, success: Optional[bool]) -> Optional[Path]:
         if self._writer is None:
             return None
@@ -851,6 +955,7 @@ class RawEpisodeManager:
                     stop_trigger_monotonic_ns=self._stop_trigger_ns,
                     success=success,
                     ingress_drops=episode_drops,
+                    termination=self._termination,
                     abort_requested=self._abort_requested.is_set,
                 )
             except BaseException:
@@ -861,6 +966,7 @@ class RawEpisodeManager:
                     self._writer = None
                     self._stop_trigger_ns = None
                     self._finalize_deadline_ns = None
+                    self._termination = None
                     self._drop_baseline = {}
                     self._pre_roll.clear()
                 raise
@@ -888,6 +994,7 @@ class RawEpisodeManager:
             )
         self._stop_trigger_ns = None
         self._finalize_deadline_ns = None
+        self._termination = None
         self._drop_baseline = {}
         self._pre_roll.clear()
         return output
@@ -911,8 +1018,16 @@ class RawEpisodeManager:
             if self._writer is None:
                 self._evict_pre_roll(now_ns)
                 if start_edge:
-                    self._start_episode(event, now_ns)
-                    self._writer.write_event(event)
+                    rejection = self._camera_start_rejection(now_ns)
+                    if rejection is None:
+                        self._start_episode(event, now_ns)
+                        self._writer.write_event(event)
+                    else:
+                        print(
+                            "[recorder] start rejected: required camera is not "
+                            f"fresh: {rejection}; release and press again"
+                        )
+                        self._pre_roll.append(event)
                 else:
                     self._pre_roll.append(event)
             else:
@@ -929,6 +1044,7 @@ class RawEpisodeManager:
             if is_controller:
                 self._prev_start = start_pressed
                 self._prev_stop = stop_pressed
+            self._finish_camera_stall_if_needed(now_ns)
 
     def handle_camera_event(self, event: Dict[str, Any]) -> None:
         """Route one camera frame without involving the state dispatcher.
@@ -946,6 +1062,11 @@ class RawEpisodeManager:
             raise ValueError("handle_camera_event requires stream='camera_head'")
         now_ns = event_monotonic_ns(event)
         with self._camera_route_lock:
+            if (
+                self._last_camera_recv_monotonic_ns is None
+                or now_ns > self._last_camera_recv_monotonic_ns
+            ):
+                self._last_camera_recv_monotonic_ns = int(now_ns)
             if self._writer is None:
                 self._evict_camera_pre_roll(now_ns)
                 self._camera_pre_roll.append(event)
@@ -958,6 +1079,8 @@ class RawEpisodeManager:
     def tick(self, now_ns: Optional[int] = None) -> None:
         with self._lock:
             current_ns = time.monotonic_ns() if now_ns is None else int(now_ns)
+            if self._finish_camera_stall_if_needed(current_ns) is not None:
+                return
             if self._finalize_deadline_ns is not None and current_ns >= self._finalize_deadline_ns:
                 self._finish_episode(status="complete", success=None)
 

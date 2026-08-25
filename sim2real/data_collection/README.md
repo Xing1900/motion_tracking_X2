@@ -400,6 +400,12 @@ Before the first right-button press, wait for non-zero `controller`,
 `hand_command`, `camera_head`, and `tracking_telemetry` counts in the
 `groot_n17` profile. The ROS-state `vla` profile instead expects `joint_states`
 and `imu_torso`.
+When `camera_head` is required, the recorder rejects A if no camera frame has
+arrived within the last 0.5 seconds; release A and press it again after the
+camera recovers. If the camera then stops for more than 2 seconds during an
+active recording, that episode is closed as `invalid` with
+`recording.termination.reason=camera_stall` instead of silently saving an
+empty or truncated visual demonstration.
 `reference` normally starts growing only after the right button enables VR and
 C++ begins requesting frames; do not wait for it beforehand. New recordings
 require `hand_command`; if the status topic is missing, the episode is retained

@@ -68,6 +68,8 @@ from x2_vr_recorder import (  # noqa: E402
     CameraIngressDispatcher,
     DEFAULT_AIMDK_IMU_TOPICS,
     DEFAULT_AIMDK_JOINT_TOPICS,
+    DEFAULT_CAMERA_START_MAX_AGE_S,
+    DEFAULT_CAMERA_STALL_TIMEOUT_S,
     DEFAULT_CAMERA_TOPIC,
     DEFAULT_HAND_STATUS_TOPIC,
     DEFAULT_TRACKING_TAP_ADDR,
@@ -82,6 +84,7 @@ from x2_vr_recorder import (  # noqa: E402
     _hash_capture_provenance_files,
     _hash_provenance_files,
     _joint_state_payload,
+    parse_args,
     _profile_topics,
     _required_joint_topics,
     _validate_shutdown_timeouts,
@@ -180,6 +183,358 @@ def tracking_telemetry_payload(sequence: int = 0):
 
 
 class RawEpisodeManagerTest(unittest.TestCase):
+    @staticmethod
+    def _camera_guard_config(**overrides):
+        config = {
+            "required_streams": ["camera_head"],
+            "minimum_stream_counts": {"camera_head": 1},
+            "max_stream_gap_s": {"camera_head": 0.5},
+            "camera_start_max_age_s": 0.5,
+            "camera_stall_timeout_s": 2.0,
+        }
+        config.update(overrides)
+        return config
+
+    def test_camera_guard_cli_defaults(self):
+        with mock.patch.object(
+            sys,
+            "argv",
+            ["x2_vr_recorder.py", "--task", "test camera guard defaults"],
+        ):
+            args = parse_args()
+
+        self.assertEqual(
+            args.camera_start_max_age_s, DEFAULT_CAMERA_START_MAX_AGE_S
+        )
+        self.assertEqual(
+            args.camera_stall_timeout_s, DEFAULT_CAMERA_STALL_TIMEOUT_S
+        )
+
+    def test_required_camera_rejects_start_until_release_and_fresh_frame(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manager = RawEpisodeManager(
+                output_root=root,
+                task="camera start gate",
+                pre_roll_s=0.5,
+                post_roll_s=0.0,
+                source_config=self._camera_guard_config(),
+                drop_counts=lambda: {},
+            )
+            manager.handle_event(
+                timed_event(
+                    "controller",
+                    1_000_000_000,
+                    controller_buttons={
+                        "right_key_one": True,
+                        "left_key_one": False,
+                    },
+                )
+            )
+            self.assertEqual(manager.state, "waiting")
+            self.assertEqual(manager._next_episode_index, 0)
+            self.assertEqual(list(root.iterdir()), [])
+
+            # A fresh frame alone does not turn the still-held button into a
+            # second edge.  The operator must release and press again.
+            manager.handle_camera_event(
+                timed_event(
+                    "camera_head",
+                    1_100_000_000,
+                    sequence=0,
+                    format="png",
+                    data=VALID_PNG,
+                )
+            )
+            manager.handle_event(
+                timed_event(
+                    "controller",
+                    1_200_000_000,
+                    controller_buttons={
+                        "right_key_one": True,
+                        "left_key_one": False,
+                    },
+                )
+            )
+            self.assertEqual(manager.state, "waiting")
+            manager.handle_event(
+                timed_event(
+                    "controller",
+                    1_300_000_000,
+                    controller_buttons={
+                        "right_key_one": False,
+                        "left_key_one": False,
+                    },
+                )
+            )
+            manager.handle_event(
+                timed_event(
+                    "controller",
+                    1_400_000_000,
+                    controller_buttons={
+                        "right_key_one": True,
+                        "left_key_one": False,
+                    },
+                )
+            )
+            self.assertEqual(manager.state, "recording")
+            self.assertEqual(manager.current_episode_index, 0)
+            manager.close()
+
+    def test_stale_required_camera_rejects_start(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manager = RawEpisodeManager(
+                output_root=root,
+                task="stale camera start gate",
+                pre_roll_s=0.5,
+                post_roll_s=0.0,
+                source_config=self._camera_guard_config(),
+                drop_counts=lambda: {},
+            )
+            manager.handle_camera_event(
+                timed_event(
+                    "camera_head",
+                    1_000_000_000,
+                    format="png",
+                    data=VALID_PNG,
+                )
+            )
+            manager.handle_event(
+                timed_event(
+                    "controller",
+                    1_500_000_001,
+                    controller_buttons={
+                        "right_key_one": True,
+                        "left_key_one": False,
+                    },
+                )
+            )
+
+            self.assertEqual(manager.state, "waiting")
+            self.assertEqual(manager._next_episode_index, 0)
+            self.assertEqual(list(root.iterdir()), [])
+
+    def test_old_source_config_without_camera_guard_keys_remains_compatible(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            manager = RawEpisodeManager(
+                output_root=Path(temporary),
+                task="legacy camera config",
+                pre_roll_s=0.0,
+                post_roll_s=0.0,
+                source_config={"required_streams": ["camera_head"]},
+                drop_counts=lambda: {},
+            )
+            manager.handle_event(
+                timed_event(
+                    "controller",
+                    1_000_000_000,
+                    controller_buttons={
+                        "right_key_one": True,
+                        "left_key_one": False,
+                    },
+                )
+            )
+
+            self.assertEqual(manager.state, "recording")
+            manager.close()
+
+    def test_camera_guard_does_not_apply_when_camera_is_not_required(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            manager = RawEpisodeManager(
+                output_root=Path(temporary),
+                task="optional camera",
+                pre_roll_s=0.0,
+                post_roll_s=0.0,
+                source_config=self._camera_guard_config(
+                    required_streams=["controller"]
+                ),
+                drop_counts=lambda: {},
+            )
+            manager.handle_event(
+                timed_event(
+                    "controller",
+                    1_000_000_000,
+                    controller_buttons={
+                        "right_key_one": True,
+                        "left_key_one": False,
+                    },
+                )
+            )
+
+            self.assertEqual(manager.state, "recording")
+            manager.close()
+
+    def test_camera_stall_on_state_event_saves_invalid_with_evidence(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manager = RawEpisodeManager(
+                output_root=root,
+                task="camera stall state watchdog",
+                pre_roll_s=0.5,
+                post_roll_s=0.0,
+                source_config=self._camera_guard_config(),
+                drop_counts=lambda: {},
+            )
+            manager.handle_camera_event(
+                timed_event(
+                    "camera_head",
+                    1_000_000_000,
+                    sequence=0,
+                    format="png",
+                    data=VALID_PNG,
+                )
+            )
+            manager.handle_event(
+                timed_event(
+                    "controller",
+                    1_100_000_000,
+                    controller_buttons={
+                        "right_key_one": True,
+                        "left_key_one": False,
+                    },
+                )
+            )
+            manager.handle_camera_event(
+                timed_event(
+                    "camera_head",
+                    1_200_000_000,
+                    sequence=1,
+                    format="png",
+                    data=VALID_PNG,
+                )
+            )
+            detected_ns = 3_200_000_001
+            manager.handle_event(timed_event("tracking_telemetry", detected_ns))
+
+            self.assertEqual(manager.state, "waiting")
+            manifest = json.loads(
+                (root / "episode_000000" / "manifest.json").read_text()
+            )
+            self.assertEqual(manifest["status"], "invalid")
+            self.assertFalse(manifest["validation"]["valid"])
+            self.assertEqual(
+                manifest["validation"]["explicit_invalid_reasons"],
+                ["camera_stall"],
+            )
+            self.assertEqual(
+                manifest["recording"]["stop_trigger_monotonic_ns"], detected_ns
+            )
+            termination = manifest["recording"]["termination"]
+            self.assertEqual(termination["reason"], "camera_stall")
+            self.assertEqual(termination["detected_monotonic_ns"], detected_ns)
+            self.assertEqual(
+                termination["last_camera_recv_monotonic_ns"], 1_200_000_000
+            )
+            self.assertAlmostEqual(termination["camera_age_s"], 2.000000001)
+            self.assertEqual(termination["stall_timeout_s"], 2.0)
+
+    def test_camera_stall_is_checked_by_tick_without_state_traffic(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manager = RawEpisodeManager(
+                output_root=root,
+                task="camera stall tick watchdog",
+                pre_roll_s=0.5,
+                post_roll_s=0.0,
+                source_config=self._camera_guard_config(),
+                drop_counts=lambda: {},
+            )
+            manager.handle_camera_event(
+                timed_event(
+                    "camera_head",
+                    1_000_000_000,
+                    format="png",
+                    data=VALID_PNG,
+                )
+            )
+            manager.handle_event(
+                timed_event(
+                    "controller",
+                    1_100_000_000,
+                    controller_buttons={
+                        "right_key_one": True,
+                        "left_key_one": False,
+                    },
+                )
+            )
+            manager.handle_camera_event(
+                timed_event(
+                    "camera_head",
+                    1_200_000_000,
+                    format="png",
+                    data=VALID_PNG,
+                )
+            )
+
+            manager.tick(now_ns=3_200_000_001)
+
+            manifest = json.loads(
+                (root / "episode_000000" / "manifest.json").read_text()
+            )
+            self.assertEqual(manifest["status"], "invalid")
+            self.assertEqual(
+                manifest["recording"]["termination"]["reason"], "camera_stall"
+            )
+
+    def test_camera_stall_watchdog_does_not_override_post_roll(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manager = RawEpisodeManager(
+                output_root=root,
+                task="camera post roll",
+                pre_roll_s=0.5,
+                post_roll_s=5.0,
+                source_config=self._camera_guard_config(),
+                drop_counts=lambda: {},
+            )
+            manager.handle_camera_event(
+                timed_event(
+                    "camera_head",
+                    1_000_000_000,
+                    format="png",
+                    data=VALID_PNG,
+                )
+            )
+            manager.handle_event(
+                timed_event(
+                    "controller",
+                    1_100_000_000,
+                    controller_buttons={
+                        "right_key_one": True,
+                        "left_key_one": False,
+                    },
+                )
+            )
+            manager.handle_camera_event(
+                timed_event(
+                    "camera_head",
+                    1_200_000_000,
+                    format="png",
+                    data=VALID_PNG,
+                )
+            )
+            manager.handle_event(
+                timed_event(
+                    "controller",
+                    1_300_000_000,
+                    controller_buttons={
+                        "right_key_one": False,
+                        "left_key_one": True,
+                    },
+                )
+            )
+
+            manager.tick(now_ns=3_500_000_000)
+            self.assertEqual(manager.state, "post_roll")
+            manager.tick(now_ns=6_300_000_000)
+
+            manifest = json.loads(
+                (root / "episode_000000" / "manifest.json").read_text()
+            )
+            self.assertEqual(manifest["status"], "complete")
+            self.assertIsNone(manifest["recording"]["termination"])
+
     def test_per_topic_tap_sequence_does_not_treat_filtering_as_loss(self):
         tracker = TapSequenceGapTracker(allow_legacy_global=False)
         controller_0 = {"tap_seq": 10, "tap_topic_seq": 0}
@@ -1414,7 +1769,7 @@ class RecorderSensorAdapterTest(unittest.TestCase):
     def test_default_camera_topic_matches_current_x2_aimdk_stream(self):
         self.assertEqual(
             DEFAULT_CAMERA_TOPIC,
-            "/aima/hal/sensor/rgbd_head_front/rgb_image/compressed",
+            "/aima/hal/sensor/rgb_head_front_center/rgb_image/compressed",
         )
 
     def test_aimdk_profile_uses_real_x2_hal_topics(self):

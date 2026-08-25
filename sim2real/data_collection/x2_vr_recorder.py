@@ -79,7 +79,7 @@ except ImportError:  # Direct execution from this directory.
     )
 
 
-DEFAULT_CAMERA_TOPIC = "/aima/hal/sensor/rgbd_head_front/rgb_image/compressed"
+DEFAULT_CAMERA_TOPIC = "/aima/hal/sensor/rgb_head_front_center/rgb_image/compressed"
 DEFAULT_HAND_STATUS_TOPIC = "/vr_hand_controller/status"
 DEFAULT_AIMDK_JOINT_TOPICS = [
     "/aima/hal/joint/leg/state",
@@ -120,6 +120,8 @@ GROOT_N17_TAP_STREAMS = ("controller",)
 DEFAULT_TRACKING_TAP_ADDR = "tcp://127.0.0.1:28707"
 DEFAULT_DISPATCHER_JOIN_TIMEOUT_S = 15.0
 MIN_DISPATCHER_JOIN_MARGIN_S = 1.0
+DEFAULT_CAMERA_START_MAX_AGE_S = 0.5
+DEFAULT_CAMERA_STALL_TIMEOUT_S = 2.0
 REQUIRED_GROOT_PROVENANCE_FILES = {
     "recorder",
     "controller_binary",
@@ -1137,6 +1139,24 @@ def parse_args() -> argparse.Namespace:
         help="Maximum time allowed to drain the bounded camera writer at finalize",
     )
     parser.add_argument(
+        "--camera_start_max_age_s",
+        type=float,
+        default=DEFAULT_CAMERA_START_MAX_AGE_S,
+        help=(
+            "Reject an episode start when a required camera has not reached "
+            "the recorder within this many seconds"
+        ),
+    )
+    parser.add_argument(
+        "--camera_stall_timeout_s",
+        type=float,
+        default=DEFAULT_CAMERA_STALL_TIMEOUT_S,
+        help=(
+            "Automatically save an active episode as invalid when its required "
+            "camera stops reaching the recorder for this many seconds"
+        ),
+    )
+    parser.add_argument(
         "--dispatcher_join_timeout_s",
         type=float,
         default=DEFAULT_DISPATCHER_JOIN_TIMEOUT_S,
@@ -1290,6 +1310,10 @@ def main() -> None:
         raise ValueError("--camera_writer_queue_frames must be positive")
     if args.camera_writer_queue_mib <= 0.0:
         raise ValueError("--camera_writer_queue_mib must be positive")
+    if args.camera_start_max_age_s <= 0.0:
+        raise ValueError("--camera_start_max_age_s must be positive")
+    if args.camera_stall_timeout_s <= 0.0:
+        raise ValueError("--camera_stall_timeout_s must be positive")
     _validate_shutdown_timeouts(
         args.camera_writer_join_timeout_s,
         args.dispatcher_join_timeout_s,
@@ -1448,6 +1472,10 @@ def main() -> None:
         "camera_ingress_queue_bytes": int(args.camera_writer_queue_mib * 1024 * 1024),
         "camera_ingress_join_timeout_s": float(args.dispatcher_join_timeout_s),
         "camera_writer_join_timeout_s": float(args.camera_writer_join_timeout_s),
+        "camera_start_max_age_s": float(args.camera_start_max_age_s),
+        "camera_stall_timeout_s": float(args.camera_stall_timeout_s),
+        "camera_guard_enabled": "camera_head" in required_streams,
+        "camera_guard_time_basis": "recorder_recv_monotonic_ns",
         "dispatcher_join_timeout_s": float(args.dispatcher_join_timeout_s),
         "hand_status_qos_depth": int(args.hand_status_qos_depth),
         "hand_status_qos_reliability": args.hand_status_qos_reliability,
