@@ -1414,7 +1414,7 @@ class RecorderSensorAdapterTest(unittest.TestCase):
     def test_default_camera_topic_matches_current_x2_aimdk_stream(self):
         self.assertEqual(
             DEFAULT_CAMERA_TOPIC,
-            "/aima/hal/sensor/rgb_head_front_center/rgb_image/compressed",
+            "/aima/hal/sensor/rgbd_head_front/rgb_image/compressed",
         )
 
     def test_aimdk_profile_uses_real_x2_hal_topics(self):

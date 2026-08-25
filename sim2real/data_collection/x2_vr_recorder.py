@@ -79,7 +79,7 @@ except ImportError:  # Direct execution from this directory.
     )
 
 
-DEFAULT_CAMERA_TOPIC = "/aima/hal/sensor/rgb_head_front_center/rgb_image/compressed"
+DEFAULT_CAMERA_TOPIC = "/aima/hal/sensor/rgbd_head_front/rgb_image/compressed"
 DEFAULT_HAND_STATUS_TOPIC = "/vr_hand_controller/status"
 DEFAULT_AIMDK_JOINT_TOPICS = [
     "/aima/hal/joint/leg/state",
